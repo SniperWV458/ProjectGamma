@@ -883,6 +883,7 @@ class DataFetcher:
             opt_c,
             on="cusip8",
             how="inner",
+
             suffixes=("_crsp", "_opt"),
         ).copy()
         link_cusip["link_method"] = "cusip8"
@@ -968,22 +969,26 @@ class DataFetcher:
         return output_file
 
     def fetch_opprcd(
-        self,
-        secid_file: Optional[Path] = None,
-        replace: Optional[bool] = None,
-        final_output_file: Optional[Path] = None,
+            self,
+            secid_file: Optional[Path] = None,
+            replace: Optional[bool] = None,
+            final_output_file: Optional[Path] = None,
     ) -> Path:
         replace = self.cfg.replace if replace is None else replace
         secid_file = secid_file or self.linked_secids_file
         final_output_file = final_output_file or self.opprcd_final_file
+
         if self.exists_and_skip(final_output_file, replace):
             return final_output_file
+
         secid_df = pd.read_parquet(secid_file)
         secid_list = sorted(secid_df["secid"].dropna().astype(int).unique().tolist())
         if not secid_list:
             raise ValueError("No SECIDs found for opprcd fetch.")
+
         chunk_dir = self.path("opprcd_chunks")
         chunk_dir.mkdir(parents=True, exist_ok=True)
+
         select_cols = [
             "secid",
             "date",
@@ -1008,33 +1013,49 @@ class DataFetcher:
             "root",
             "suffix",
         ]
-        chunk_specs = []
-        for year in self.iter_years():
-            for chunk_idx, start_i in enumerate(range(0, len(secid_list), self.cfg.optionm_secid_chunk_size)):
+
+        month_specs = []
+        secid_ranges = list(range(0, len(secid_list), self.cfg.optionm_secid_chunk_size))
+
+        for year, month in self.iter_months():
+            for chunk_idx, start_i in enumerate(secid_ranges):
                 end_i = min(start_i + self.cfg.optionm_secid_chunk_size, len(secid_list))
-                chunk_specs.append((year, chunk_idx, start_i, end_i))
-        outer_pbar = tqdm(chunk_specs, desc="opprcd chunks", unit="chunk")
-        for year, chunk_idx, start_i, end_i in outer_pbar:
+                month_specs.append((year, month, chunk_idx, start_i, end_i))
+
+        outer_pbar = tqdm(month_specs, desc="opprcd month-chunks", unit="chunk")
+
+        for year, month, chunk_idx, start_i, end_i in outer_pbar:
             sub = secid_list[start_i:end_i]
-            chunk_file = chunk_dir / f"opprcd_{year}_chunk_{chunk_idx:05d}.parquet"
+            chunk_file = chunk_dir / f"opprcd_{year}_{month:02d}_chunk_{chunk_idx:05d}.parquet"
+
             if self.exists_and_skip(chunk_file, replace):
-                outer_pbar.set_postfix_str(f"skip {year} c{chunk_idx:05d}")
+                outer_pbar.set_postfix_str(f"skip {year}-{month:02d} c{chunk_idx:05d}")
                 continue
+
+            start_date = pd.Timestamp(year=year, month=month, day=1)
+            end_date = start_date + pd.offsets.MonthEnd(1)
+
             table_name = f"opprcd{year}"
             in_clause = self.sql_in_clause(sub)
+
             sql = f"""
                 select {", ".join(select_cols)}
                 from optionm_all.{table_name}
                 where secid in ({in_clause})
+                  and date between '{start_date.date()}' and '{end_date.date()}'
             """
+
             df_part = self.raw_sql(sql, date_cols=["date", "exdate"])
             self.write_df(df_part, chunk_file, file_type="parquet")
-            outer_pbar.set_postfix_str(f"saved {year} c{chunk_idx:05d}")
+            outer_pbar.set_postfix_str(f"saved {year}-{month:02d} c{chunk_idx:05d}")
+
         if self.exists_and_skip(final_output_file, replace):
             return final_output_file
+
         chunk_files = sorted(chunk_dir.glob("opprcd_*.parquet"))
         if not chunk_files:
             raise FileNotFoundError(f"No chunk parquet files found in {chunk_dir}")
+
         pq_glob = chunk_dir / "opprcd_*.parquet"
         con = duckdb.connect()
         try:
@@ -1071,9 +1092,11 @@ class DataFetcher:
             """)
         finally:
             con.close()
+
         if not self.cfg.keep_intermediate_csv:
             for f in chunk_files:
                 f.unlink(missing_ok=True)
+
         return final_output_file
 
     def build_daily_net_gamma(
