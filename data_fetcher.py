@@ -122,10 +122,10 @@ class DataFetcher:
         raise ValueError(f"Unsupported file: {filepath}")
 
     def combine_csvs_to_parquet_with_duckdb(
-        self,
-        output_path: Path,
-        cast_sql: str,
-        compression: Optional[str] = None,
+            self,
+            output_path: Path,
+            cast_sql: str,
+            compression: Optional[str] = None,
     ) -> Path:
         compression = compression or self.cfg.compression
         con = duckdb.connect()
@@ -156,250 +156,6 @@ class DataFetcher:
 
     def list_tables(self, library: str) -> list[str]:
         return self.connect().list_tables(library=library)
-
-    def log_parquet_inventory(
-            self,
-            output_file: Optional[Path] = None,
-            recursive: bool = True,
-    ) -> Path:
-        output_file = output_file or self.path("parquet_inventory_log.txt")
-        pattern = "**/*.parquet" if recursive else "*.parquet"
-        parquet_files = sorted(self.data_dir.glob(pattern))
-
-        con = duckdb.connect()
-
-        def _fmt_value(x):
-            if x is None:
-                return "NULL"
-            if isinstance(x, float):
-                return f"{x:.6g}"
-            return str(x)
-
-        lines = []
-        lines.append(f"Data directory: {self.data_dir.resolve()}")
-        lines.append(f"Parquet files found: {len(parquet_files)}")
-        lines.append("")
-
-        if not parquet_files:
-            lines.append("No parquet files found.")
-            output_file.write_text("\n".join(lines), encoding="utf-8")
-            con.close()
-            return output_file
-
-        try:
-            for fp in parquet_files:
-                rel = fp.relative_to(self.data_dir)
-
-                lines.append("=" * 100)
-                lines.append(f"FILE: {rel.as_posix()}")
-                lines.append(f"PATH: {fp.resolve()}")
-
-                try:
-                    file_size_mb = fp.stat().st_size / (1024 * 1024)
-                    lines.append(f"SIZE_MB: {file_size_mb:.3f}")
-                except Exception as e:
-                    lines.append(f"SIZE_MB: ERROR ({e})")
-
-                try:
-                    schema_df = con.execute(
-                        f"DESCRIBE SELECT * FROM read_parquet('{fp.as_posix()}')"
-                    ).fetchdf()
-
-                    count_df = con.execute(
-                        f"SELECT COUNT(*) AS n_rows FROM read_parquet('{fp.as_posix()}')"
-                    ).fetchdf()
-                    n_rows = int(count_df.loc[0, "n_rows"])
-
-                    lines.append(f"ROWS: {n_rows}")
-                    lines.append("")
-                    lines.append("SCHEMA:")
-                    for _, row in schema_df.iterrows():
-                        col_name = row["column_name"]
-                        col_type = row["column_type"]
-                        null_flag = row["null"]
-                        lines.append(f"  - {col_name}: {col_type} | null={null_flag}")
-
-                    lines.append("")
-                    lines.append("COLUMN STATISTICS:")
-
-                    for _, row in schema_df.iterrows():
-                        col = row["column_name"]
-                        col_type = str(row["column_type"]).upper()
-
-                        safe_col = f'"{col}"'
-
-                        try:
-                            if any(t in col_type for t in
-                                   ["INT", "DOUBLE", "FLOAT", "DECIMAL", "BIGINT", "SMALLINT", "HUGEINT"]):
-                                stat_df = con.execute(f"""
-                                    SELECT
-                                        COUNT(*) AS n,
-                                        COUNT({safe_col}) AS non_null,
-                                        COUNT(DISTINCT {safe_col}) AS n_distinct,
-                                        MIN({safe_col}) AS min_val,
-                                        MAX({safe_col}) AS max_val,
-                                        AVG({safe_col}) AS mean_val
-                                    FROM read_parquet('{fp.as_posix()}')
-                                """).fetchdf()
-
-                                r = stat_df.iloc[0]
-                                lines.append(
-                                    f"  - {col}: n={_fmt_value(r['n'])}, "
-                                    f"non_null={_fmt_value(r['non_null'])}, "
-                                    f"distinct={_fmt_value(r['n_distinct'])}, "
-                                    f"min={_fmt_value(r['min_val'])}, "
-                                    f"max={_fmt_value(r['max_val'])}, "
-                                    f"mean={_fmt_value(r['mean_val'])}"
-                                )
-
-                            elif "DATE" in col_type or "TIMESTAMP" in col_type:
-                                stat_df = con.execute(f"""
-                                    SELECT
-                                        COUNT(*) AS n,
-                                        COUNT({safe_col}) AS non_null,
-                                        COUNT(DISTINCT {safe_col}) AS n_distinct,
-                                        MIN({safe_col}) AS min_val,
-                                        MAX({safe_col}) AS max_val
-                                    FROM read_parquet('{fp.as_posix()}')
-                                """).fetchdf()
-
-                                r = stat_df.iloc[0]
-                                lines.append(
-                                    f"  - {col}: n={_fmt_value(r['n'])}, "
-                                    f"non_null={_fmt_value(r['non_null'])}, "
-                                    f"distinct={_fmt_value(r['n_distinct'])}, "
-                                    f"min={_fmt_value(r['min_val'])}, "
-                                    f"max={_fmt_value(r['max_val'])}"
-                                )
-
-                            elif "BOOL" in col_type:
-                                stat_df = con.execute(f"""
-                                    SELECT
-                                        COUNT(*) AS n,
-                                        COUNT({safe_col}) AS non_null,
-                                        SUM(CASE WHEN {safe_col} THEN 1 ELSE 0 END) AS n_true,
-                                        SUM(CASE WHEN NOT {safe_col} THEN 1 ELSE 0 END) AS n_false
-                                    FROM read_parquet('{fp.as_posix()}')
-                                """).fetchdf()
-
-                                r = stat_df.iloc[0]
-                                lines.append(
-                                    f"  - {col}: n={_fmt_value(r['n'])}, "
-                                    f"non_null={_fmt_value(r['non_null'])}, "
-                                    f"true={_fmt_value(r['n_true'])}, "
-                                    f"false={_fmt_value(r['n_false'])}"
-                                )
-
-                            else:
-                                stat_df = con.execute(f"""
-                                    SELECT
-                                        COUNT(*) AS n,
-                                        COUNT({safe_col}) AS non_null,
-                                        COUNT(DISTINCT {safe_col}) AS n_distinct
-                                    FROM read_parquet('{fp.as_posix()}')
-                                """).fetchdf()
-
-                                sample_df = con.execute(f"""
-                                    SELECT DISTINCT {safe_col} AS val
-                                    FROM read_parquet('{fp.as_posix()}')
-                                    WHERE {safe_col} IS NOT NULL
-                                    LIMIT 5
-                                """).fetchdf()
-
-                                r = stat_df.iloc[0]
-                                samples = ", ".join(_fmt_value(v) for v in sample_df["val"].tolist())
-                                lines.append(
-                                    f"  - {col}: n={_fmt_value(r['n'])}, "
-                                    f"non_null={_fmt_value(r['non_null'])}, "
-                                    f"distinct={_fmt_value(r['n_distinct'])}, "
-                                    f"samples=[{samples}]"
-                                )
-
-                        except Exception as e:
-                            lines.append(f"  - {col}: STAT ERROR ({e})")
-
-                    lines.append("")
-
-                except Exception as e:
-                    lines.append(f"ERROR READING FILE: {e}")
-                    lines.append("")
-
-        finally:
-            con.close()
-
-        output_file.write_text("\n".join(lines), encoding="utf-8")
-        return output_file
-
-    def export_parquet_sample_to_csv(
-            self,
-            parquet_file: Path | str,
-            output_file: Optional[Path | str] = None,
-            n: Optional[int] = None,
-            frac: Optional[float] = None,
-            order_by: Optional[str] = None,
-            replace: Optional[bool] = None,
-    ) -> Path:
-        replace = self.cfg.replace if replace is None else replace
-        parquet_file = Path(parquet_file)
-
-        if not parquet_file.exists():
-            raise FileNotFoundError(f"Parquet file does not exist: {parquet_file}")
-
-        if (n is None and frac is None) or (n is not None and frac is not None):
-            raise ValueError("Provide exactly one of n or frac.")
-
-        if frac is not None and not (0 < frac <= 1):
-            raise ValueError("frac must be in (0, 1].")
-
-        if output_file is None:
-            if n is not None:
-                output_file = parquet_file.with_name(f"{parquet_file.stem}_head_{n}.csv")
-            else:
-                pct = int(frac * 100)
-                output_file = parquet_file.with_name(f"{parquet_file.stem}_sample_{pct}pct.csv")
-        output_file = Path(output_file)
-
-        if self.exists_and_skip(output_file, replace):
-            return output_file
-
-        con = duckdb.connect()
-        try:
-            if n is not None:
-                order_sql = f"ORDER BY {order_by}" if order_by else ""
-                con.execute(f"""
-                    COPY (
-                        SELECT *
-                        FROM read_parquet('{parquet_file.as_posix()}')
-                        {order_sql}
-                        LIMIT {int(n)}
-                    )
-                    TO '{output_file.as_posix()}'
-                    (HEADER, DELIMITER ',')
-                """)
-            else:
-                total_df = con.execute(f"""
-                    SELECT COUNT(*) AS n_rows
-                    FROM read_parquet('{parquet_file.as_posix()}')
-                """).fetchdf()
-                total_rows = int(total_df.loc[0, "n_rows"])
-                sample_n = max(1, int(total_rows * frac))
-
-                order_sql = f"ORDER BY {order_by}" if order_by else ""
-                con.execute(f"""
-                    COPY (
-                        SELECT *
-                        FROM read_parquet('{parquet_file.as_posix()}')
-                        {order_sql}
-                        LIMIT {sample_n}
-                    )
-                    TO '{output_file.as_posix()}'
-                    (HEADER, DELIMITER ',')
-                """)
-
-        finally:
-            con.close()
-
-        return output_file
 
     @property
     def crsp_stocknames_file(self) -> Path:
@@ -928,11 +684,11 @@ class DataFetcher:
         return output_all, output_dom
 
     def build_linked_secid_file_from_top_liquid(
-        self,
-        top_liquid_file: Optional[Path] = None,
-        link_file: Optional[Path] = None,
-        output_file: Optional[Path] = None,
-        replace: Optional[bool] = None,
+            self,
+            top_liquid_file: Optional[Path] = None,
+            link_file: Optional[Path] = None,
+            output_file: Optional[Path] = None,
+            replace: Optional[bool] = None,
     ) -> Path:
         replace = self.cfg.replace if replace is None else replace
         top_liquid_file = top_liquid_file or self.crsp_top_liquid_file
@@ -1099,71 +855,116 @@ class DataFetcher:
 
         return final_output_file
 
-    def build_daily_net_gamma(
-        self,
-        opprcd_file: Optional[Path] = None,
-        link_file: Optional[Path] = None,
-        output_file: Optional[Path] = None,
-        replace: Optional[bool] = None,
+    def fetch_secprd(
+            self,
+            secid_file: Optional[Path] = None,
+            replace: Optional[bool] = None,
+            final_output_file: Optional[Path] = None,
     ) -> Path:
         replace = self.cfg.replace if replace is None else replace
-        opprcd_file = opprcd_file or self.opprcd_final_file
-        link_file = link_file or self.crsp_optionm_link_dominant_file
-        output_file = output_file or self.daily_net_gamma_file
-        if self.exists_and_skip(output_file, replace):
-            return output_file
+        secid_file = secid_file or self.linked_secids_file
+        final_output_file = final_output_file or self.path(
+            f"secprd_linked_{self.cfg.start_year}_{self.cfg.end_year}.parquet"
+        )
+
+        if self.exists_and_skip(final_output_file, replace):
+            return final_output_file
+
+        secid_df = pd.read_parquet(secid_file)
+        secid_list = sorted(secid_df["secid"].dropna().astype(int).unique().tolist())
+        if not secid_list:
+            raise ValueError("No SECIDs found for secprd fetch.")
+
+        chunk_dir = self.path("secprd_chunks")
+        chunk_dir.mkdir(parents=True, exist_ok=True)
+
+        select_cols = [
+            "secid",
+            "date",
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+            "return",
+            "cfadj",
+            "cfret",
+            "shrout",
+        ]
+
+        month_specs = []
+        secid_ranges = list(range(0, len(secid_list), self.cfg.optionm_secid_chunk_size))
+
+        for year, month in self.iter_months():
+            for chunk_idx, start_i in enumerate(secid_ranges):
+                end_i = min(start_i + self.cfg.optionm_secid_chunk_size, len(secid_list))
+                month_specs.append((year, month, chunk_idx, start_i, end_i))
+
+        outer_pbar = tqdm(month_specs, desc="secprd month-chunks", unit="chunk")
+
+        for year, month, chunk_idx, start_i, end_i in outer_pbar:
+            sub = secid_list[start_i:end_i]
+            chunk_file = chunk_dir / f"secprd_{year}_{month:02d}_chunk_{chunk_idx:05d}.parquet"
+
+            if self.exists_and_skip(chunk_file, replace):
+                outer_pbar.set_postfix_str(f"skip {year}-{month:02d} c{chunk_idx:05d}")
+                continue
+
+            start_date = pd.Timestamp(year=year, month=month, day=1)
+            end_date = start_date + pd.offsets.MonthEnd(1)
+
+            table_name = f"secprd{year}"
+            in_clause = self.sql_in_clause(sub)
+
+            sql = f"""
+                select {", ".join(select_cols)}
+                from optionm_all.{table_name}
+                where secid in ({in_clause})
+                  and date between '{start_date.date()}' and '{end_date.date()}'
+            """
+
+            df_part = self.raw_sql(sql, date_cols=["date"])
+            self.write_df(df_part, chunk_file, file_type="parquet")
+            outer_pbar.set_postfix_str(f"saved {year}-{month:02d} c{chunk_idx:05d}")
+
+        if self.exists_and_skip(final_output_file, replace):
+            return final_output_file
+
+        chunk_files = sorted(chunk_dir.glob("secprd_*.parquet"))
+        if not chunk_files:
+            raise FileNotFoundError(f"No chunk parquet files found in {chunk_dir}")
+
+        pq_glob = chunk_dir / "secprd_*.parquet"
         con = duckdb.connect()
         try:
             con.execute(f"""
                 COPY (
-                    WITH link AS (
-                        SELECT
-                            CAST(permno AS BIGINT) AS permno,
-                            CAST(secid AS BIGINT) AS secid
-                        FROM read_parquet('{link_file.as_posix()}')
-                    ),
-                    base AS (
-                        SELECT
-                            l.permno,
-                            o.secid,
-                            o.date,
-                            o.exdate,
-                            o.optionid,
-                            o.cp_flag,
-                            o.gamma,
-                            o.open_interest,
-                            o.contract_size,
-                            CASE
-                                WHEN o.cp_flag = 'C' THEN 1.0
-                                WHEN o.cp_flag = 'P' THEN -1.0
-                                ELSE NULL
-                            END AS cp_sign
-                        FROM read_parquet('{opprcd_file.as_posix()}') o
-                        INNER JOIN link l
-                            ON o.secid = l.secid
-                        WHERE o.gamma IS NOT NULL
-                          AND o.open_interest IS NOT NULL
-                          AND o.contract_size IS NOT NULL
-                    )
                     SELECT
-                        permno,
-                        secid,
-                        date,
-                        COUNT(*) AS n_opts,
-                        SUM(gamma * open_interest * contract_size) AS gross_gamma_oi,
-                        SUM(cp_sign * gamma * open_interest * contract_size) AS net_gamma_oi,
-                        SUM(CASE WHEN cp_flag = 'C' THEN gamma * open_interest * contract_size ELSE 0 END) AS call_gamma_oi,
-                        SUM(CASE WHEN cp_flag = 'P' THEN gamma * open_interest * contract_size ELSE 0 END) AS put_gamma_oi
-                    FROM base
-                    GROUP BY permno, secid, date
-                    ORDER BY date, permno
+                        CAST(secid AS BIGINT) AS secid,
+                        CAST(date AS DATE) AS date,
+                        CAST(open AS DOUBLE) AS open,
+                        CAST(high AS DOUBLE) AS high,
+                        CAST(low AS DOUBLE) AS low,
+                        CAST(close AS DOUBLE) AS close,
+                        CAST(volume AS DOUBLE) AS volume,
+                        CAST(return AS DOUBLE) AS return,
+                        CAST(cfadj AS DOUBLE) AS cfadj,
+                        CAST(cfret AS DOUBLE) AS cfret,
+                        CAST(shrout AS DOUBLE) AS shrout
+                    FROM read_parquet('{pq_glob.as_posix()}')
+                    ORDER BY date, secid
                 )
-                TO '{output_file.as_posix()}'
+                TO '{final_output_file.as_posix()}'
                 (FORMAT PARQUET, COMPRESSION '{self.cfg.compression}')
             """)
         finally:
             con.close()
-        return output_file
+
+        if not self.cfg.keep_intermediate_csv:
+            for f in chunk_files:
+                f.unlink(missing_ok=True)
+
+        return final_output_file
 
     def summarize_link_coverage(self) -> None:
         link = pd.read_parquet(self.crsp_optionm_link_dominant_file)
@@ -1197,7 +998,6 @@ class DataFetcher:
         self.build_top_liquid_stock_universe(top_pct=top_pct)
         self.build_linked_secid_file_from_top_liquid()
         self.fetch_opprcd()
-        self.build_daily_net_gamma()
 
     def manifest_file(self, name: str = "manifest.parquet") -> Path:
         return self.path(name)
