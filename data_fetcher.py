@@ -4,6 +4,8 @@ import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Sequence, Literal
+import threading
+from queue import Queue, Empty
 
 import duckdb
 import pandas as pd
@@ -37,7 +39,6 @@ class DataFetcher:
         self.data_dir = Path(self.cfg.data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.db: Optional[wrds.Connection] = None
-        self.connect()
 
     def connect(self) -> wrds.Connection:
         if self.db is None:
@@ -204,6 +205,67 @@ class DataFetcher:
     def daily_net_gamma_file(self) -> Path:
         return self.path(f"daily_net_gamma_{self.cfg.start_year}_{self.cfg.end_year}.parquet")
 
+    def _run_tasks_with_connection_pool(
+            self,
+            tasks: list,
+            worker_fn,
+            desc: str,
+            n_connections: int = 5,
+    ) -> list:
+        if n_connections < 1:
+            raise ValueError("n_connections must be >= 1")
+
+        self.close()
+
+        task_queue: Queue = Queue()
+        for task in tasks:
+            task_queue.put(task)
+
+        results = []
+        errors = []
+        lock = threading.Lock()
+        pbar = tqdm(total=len(tasks), desc=desc, unit="task")
+
+        def _worker():
+            db = None
+            try:
+                db = wrds.Connection(wrds_username=self.cfg.wrds_username)
+                while True:
+                    try:
+                        task = task_queue.get_nowait()
+                    except Empty:
+                        break
+
+                    try:
+                        worker_fn(db, task, results, errors, lock)
+                    except Exception as e:
+                        with lock:
+                            errors.append((task, e))
+                    finally:
+                        with lock:
+                            pbar.update(1)
+                        task_queue.task_done()
+            finally:
+                if db is not None:
+                    try:
+                        db.close()
+                    except Exception:
+                        pass
+
+        threads = [threading.Thread(target=_worker, daemon=True) for _ in range(n_connections)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        pbar.close()
+
+        if errors:
+            task, exc = errors[0]
+            raise RuntimeError(f"Task failed: {task}") from exc
+
+        return results
+
     def get_common_stock_permnos(self) -> list[int]:
         sql = f"""
             select distinct permno
@@ -268,6 +330,9 @@ class DataFetcher:
             output_name: str = "crsp_dsf_monthly",
             combine_final: bool = True,
     ) -> Path:
+        import threading
+        from queue import Queue, Empty
+
         replace = self.cfg.replace if replace is None else replace
         out_dir = self.monthly_dir(output_name)
 
@@ -275,10 +340,116 @@ class DataFetcher:
             permno_list = self.get_common_stock_permnos()
 
         permno_list = [int(x) for x in permno_list if pd.notna(x)]
+        if not permno_list:
+            raise ValueError("No PERMNOs found for CRSP DSF fetch.")
+
         permno_chunks = self.chunk_list(permno_list, self.cfg.crsp_permno_chunk_size)
 
-        month_pbar = tqdm(self.iter_months(), desc="CRSP DSF months", unit="month")
+        # Ensure no persistent connection occupies an extra WRDS slot.
+        self.close()
 
+        tasks: list[tuple[int, int, int, list[int], Path]] = []
+        month_row_counts: dict[tuple[int, int], int] = {}
+
+        for year, month in self.iter_months():
+            ym = f"{year}_{month:02d}"
+            month_dir = out_dir / ym
+            month_dir.mkdir(parents=True, exist_ok=True)
+            month_row_counts[(year, month)] = 0
+
+            for chunk_idx, sub_permnos in enumerate(permno_chunks):
+                chunk_file = month_dir / f"crsp_dsf_{ym}_chunk_{chunk_idx:05d}.parquet"
+                tasks.append((year, month, chunk_idx, list(sub_permnos), chunk_file))
+
+        task_queue: Queue = Queue()
+        for task in tasks:
+            task_queue.put(task)
+
+        errors: list[tuple[tuple[int, int, int, list[int], Path], Exception]] = []
+        state_lock = threading.Lock()
+        pbar_lock = threading.Lock()
+
+        def worker(pbar) -> None:
+            db = None
+            try:
+                db = wrds.Connection(wrds_username=self.cfg.wrds_username)
+
+                while True:
+                    try:
+                        year, month, chunk_idx, sub_permnos, chunk_file = task_queue.get_nowait()
+                    except Empty:
+                        break
+
+                    try:
+                        if not self.exists_and_skip(chunk_file, replace):
+                            start_date = pd.Timestamp(year=year, month=month, day=1)
+                            end_date = start_date + pd.offsets.MonthEnd(1)
+
+                            in_clause = self.sql_in_clause(sub_permnos)
+
+                            prc_filter = ""
+                            if self.cfg.min_abs_prc is not None:
+                                prc_filter = f" and abs(prc) >= {float(self.cfg.min_abs_prc)}"
+
+                            sql = f"""
+                                select
+                                    permno,
+                                    date,
+                                    prc,
+                                    ret,
+                                    retx,
+                                    shrout,
+                                    vol,
+                                    bidlo,
+                                    askhi
+                                from crsp.dsf
+                                where date between '{start_date.date()}' and '{end_date.date()}'
+                                  and permno in ({in_clause})
+                                  {prc_filter}
+                            """
+
+                            df_part = db.raw_sql(sql, date_cols=["date"])
+                            self.write_df(df_part, chunk_file, file_type="parquet")
+
+                            with state_lock:
+                                month_row_counts[(year, month)] += len(df_part)
+
+                        with pbar_lock:
+                            pbar.update(1)
+                            pbar.set_postfix_str(f"{year}-{month:02d} c{chunk_idx:05d}")
+
+                    except Exception as e:
+                        with state_lock:
+                            errors.append(((year, month, chunk_idx, sub_permnos, chunk_file), e))
+                        with pbar_lock:
+                            pbar.update(1)
+                            pbar.set_postfix_str(f"ERR {year}-{month:02d} c{chunk_idx:05d}")
+                    finally:
+                        task_queue.task_done()
+
+            finally:
+                if db is not None:
+                    try:
+                        db.close()
+                    except Exception:
+                        pass
+
+        n_connections = 5
+        with tqdm(total=len(tasks), desc="CRSP DSF month-chunks", unit="chunk") as pbar:
+            threads = [threading.Thread(target=worker, args=(pbar,), daemon=True) for _ in range(n_connections)]
+
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+
+        if errors:
+            task, exc = errors[0]
+            raise RuntimeError(
+                f"CRSP DSF fetch failed for year={task[0]}, month={task[1]:02d}, chunk={task[2]:05d}"
+            ) from exc
+
+        month_pbar = tqdm(self.iter_months(), desc="Combine CRSP DSF months", unit="month")
         for year, month in month_pbar:
             ym = f"{year}_{month:02d}"
             out_file = out_dir / f"crsp_dsf_{ym}.parquet"
@@ -287,54 +458,48 @@ class DataFetcher:
                 month_pbar.set_postfix_str(f"skip {ym}")
                 continue
 
-            start_date = pd.Timestamp(year=year, month=month, day=1)
-            end_date = start_date + pd.offsets.MonthEnd(1)
+            month_dir = out_dir / ym
+            pq_glob = month_dir / f"crsp_dsf_{ym}_chunk_*.parquet"
+            chunk_files = sorted(month_dir.glob(f"crsp_dsf_{ym}_chunk_*.parquet"))
 
-            monthly_parts = []
+            if chunk_files:
+                con = duckdb.connect()
+                try:
+                    con.execute(f"""
+                        COPY (
+                            SELECT
+                                CAST(permno AS BIGINT) AS permno,
+                                CAST(date AS DATE) AS date,
+                                CAST(prc AS DOUBLE) AS prc,
+                                CAST(ret AS DOUBLE) AS ret,
+                                CAST(retx AS DOUBLE) AS retx,
+                                CAST(shrout AS DOUBLE) AS shrout,
+                                CAST(vol AS DOUBLE) AS vol,
+                                CAST(bidlo AS DOUBLE) AS bidlo,
+                                CAST(askhi AS DOUBLE) AS askhi
+                            FROM read_parquet('{pq_glob.as_posix()}')
+                            ORDER BY date, permno
+                        )
+                        TO '{out_file.as_posix()}'
+                        (FORMAT PARQUET, COMPRESSION '{self.cfg.compression}')
+                    """)
+                finally:
+                    con.close()
 
-            chunk_pbar = tqdm(
-                permno_chunks,
-                desc=f"{year}-{month:02d}",
-                unit="chunk",
-                leave=False,
-            )
-
-            for sub_permnos in chunk_pbar:
-                in_clause = self.sql_in_clause(sub_permnos)
-
-                prc_filter = ""
-                if self.cfg.min_abs_prc is not None:
-                    prc_filter = f" and abs(prc) >= {float(self.cfg.min_abs_prc)}"
-
-                sql = f"""
-                    select
-                        permno,
-                        date,
-                        prc,
-                        ret,
-                        retx,
-                        shrout,
-                        vol,
-                        bidlo,
-                        askhi
-                    from crsp.dsf
-                    where date between '{start_date.date()}' and '{end_date.date()}'
-                      and permno in ({in_clause})
-                      {prc_filter}
-                """
-
-                df_part = self.raw_sql(sql, date_cols=["date"])
-                monthly_parts.append(df_part)
-
-            if monthly_parts:
-                df_month = pd.concat(monthly_parts, ignore_index=True)
+                if not self.cfg.keep_intermediate_csv:
+                    for f in chunk_files:
+                        f.unlink(missing_ok=True)
+                    try:
+                        month_dir.rmdir()
+                    except OSError:
+                        pass
             else:
                 df_month = pd.DataFrame(
                     columns=["permno", "date", "prc", "ret", "retx", "shrout", "vol", "bidlo", "askhi"]
                 )
+                self.write_df(df_month, out_file, file_type="parquet")
 
-            self.write_df(df_month, out_file, file_type="parquet")
-            month_pbar.set_postfix_str(f"saved {ym} ({len(df_month):,} rows)")
+            month_pbar.set_postfix_str(f"saved {ym} ({month_row_counts[(year, month)]:,} rows)")
 
         if combine_final:
             return self.combine_monthly_crsp_files(monthly_subdir=output_name, replace=replace)
@@ -770,27 +935,26 @@ class DataFetcher:
             "suffix",
         ]
 
-        month_specs = []
+        tasks = []
         secid_ranges = list(range(0, len(secid_list), self.cfg.optionm_secid_chunk_size))
 
         for year, month in self.iter_months():
             for chunk_idx, start_i in enumerate(secid_ranges):
                 end_i = min(start_i + self.cfg.optionm_secid_chunk_size, len(secid_list))
-                month_specs.append((year, month, chunk_idx, start_i, end_i))
+                sub = secid_list[start_i:end_i]
+                chunk_file = chunk_dir / f"opprcd_{year}_{month:02d}_chunk_{chunk_idx:05d}.parquet"
+                tasks.append((year, month, chunk_idx, sub, chunk_file))
 
-        outer_pbar = tqdm(month_specs, desc="opprcd month-chunks", unit="chunk")
-
-        for year, month, chunk_idx, start_i, end_i in outer_pbar:
-            sub = secid_list[start_i:end_i]
-            chunk_file = chunk_dir / f"opprcd_{year}_{month:02d}_chunk_{chunk_idx:05d}.parquet"
+        def worker_fn(db, task, results, errors, lock):
+            year, month, chunk_idx, sub, chunk_file = task
 
             if self.exists_and_skip(chunk_file, replace):
-                outer_pbar.set_postfix_str(f"skip {year}-{month:02d} c{chunk_idx:05d}")
-                continue
+                with lock:
+                    results.append((year, month, chunk_idx, "skipped"))
+                return
 
             start_date = pd.Timestamp(year=year, month=month, day=1)
             end_date = start_date + pd.offsets.MonthEnd(1)
-
             table_name = f"opprcd{year}"
             in_clause = self.sql_in_clause(sub)
 
@@ -801,9 +965,18 @@ class DataFetcher:
                   and date between '{start_date.date()}' and '{end_date.date()}'
             """
 
-            df_part = self.raw_sql(sql, date_cols=["date", "exdate"])
+            df_part = db.raw_sql(sql, date_cols=["date", "exdate"])
             self.write_df(df_part, chunk_file, file_type="parquet")
-            outer_pbar.set_postfix_str(f"saved {year}-{month:02d} c{chunk_idx:05d}")
+
+            with lock:
+                results.append((year, month, chunk_idx, "saved"))
+
+        self._run_tasks_with_connection_pool(
+            tasks=tasks,
+            worker_fn=worker_fn,
+            desc="opprcd month-chunks",
+            n_connections=5,
+        )
 
         if self.exists_and_skip(final_output_file, replace):
             return final_output_file
@@ -892,27 +1065,26 @@ class DataFetcher:
             "shrout",
         ]
 
-        month_specs = []
+        tasks = []
         secid_ranges = list(range(0, len(secid_list), self.cfg.optionm_secid_chunk_size))
 
         for year, month in self.iter_months():
             for chunk_idx, start_i in enumerate(secid_ranges):
                 end_i = min(start_i + self.cfg.optionm_secid_chunk_size, len(secid_list))
-                month_specs.append((year, month, chunk_idx, start_i, end_i))
+                sub = secid_list[start_i:end_i]
+                chunk_file = chunk_dir / f"secprd_{year}_{month:02d}_chunk_{chunk_idx:05d}.parquet"
+                tasks.append((year, month, chunk_idx, sub, chunk_file))
 
-        outer_pbar = tqdm(month_specs, desc="secprd month-chunks", unit="chunk")
-
-        for year, month, chunk_idx, start_i, end_i in outer_pbar:
-            sub = secid_list[start_i:end_i]
-            chunk_file = chunk_dir / f"secprd_{year}_{month:02d}_chunk_{chunk_idx:05d}.parquet"
+        def worker_fn(db, task, results, errors, lock):
+            year, month, chunk_idx, sub, chunk_file = task
 
             if self.exists_and_skip(chunk_file, replace):
-                outer_pbar.set_postfix_str(f"skip {year}-{month:02d} c{chunk_idx:05d}")
-                continue
+                with lock:
+                    results.append((year, month, chunk_idx, "skipped"))
+                return
 
             start_date = pd.Timestamp(year=year, month=month, day=1)
             end_date = start_date + pd.offsets.MonthEnd(1)
-
             table_name = f"secprd{year}"
             in_clause = self.sql_in_clause(sub)
 
@@ -923,9 +1095,18 @@ class DataFetcher:
                   and date between '{start_date.date()}' and '{end_date.date()}'
             """
 
-            df_part = self.raw_sql(sql, date_cols=["date"])
+            df_part = db.raw_sql(sql, date_cols=["date"])
             self.write_df(df_part, chunk_file, file_type="parquet")
-            outer_pbar.set_postfix_str(f"saved {year}-{month:02d} c{chunk_idx:05d}")
+
+            with lock:
+                results.append((year, month, chunk_idx, "saved"))
+
+        self._run_tasks_with_connection_pool(
+            tasks=tasks,
+            worker_fn=worker_fn,
+            desc="secprd month-chunks",
+            n_connections=5,
+        )
 
         if self.exists_and_skip(final_output_file, replace):
             return final_output_file

@@ -69,9 +69,6 @@ class OptionGammaProcessor:
         self._last_sql: Optional[str] = None
         self._register_sources() 
 
-    # ------------------------------------------------------------------
-    # Initialization
-    # ------------------------------------------------------------------
     def _build_logger(self) -> logging.Logger:
         logger = logging.getLogger(f"{self.__class__.__name__}_{id(self)}")
         logger.setLevel(self.cfg.log_level)
@@ -124,9 +121,6 @@ class OptionGammaProcessor:
                 """
             )
 
-    # ------------------------------------------------------------------
-    # Public properties
-    # ------------------------------------------------------------------
     @property
     def last_sql(self) -> Optional[str]:
         return self._last_sql
@@ -139,9 +133,6 @@ class OptionGammaProcessor:
     def spot_price_field(self) -> str:
         return self.cfg.spot_price_field
 
-    # ------------------------------------------------------------------
-    # Core execution helpers
-    # ------------------------------------------------------------------
     def _timed_query(self, sql: str, fetch: Literal["df", "one", "none"] = "df"):
         self._last_sql = sql
         self.logger.debug("Executing SQL:\n%s", sql)
@@ -184,9 +175,6 @@ class OptionGammaProcessor:
 
         return path
 
-    # ------------------------------------------------------------------
-    # SQL blocks
-    # ------------------------------------------------------------------
     def _base_where_clauses(self) -> list[str]:
         clauses = ["1=1"]
 
@@ -400,9 +388,6 @@ class OptionGammaProcessor:
         ORDER BY n_rows DESC, date, optionid
         """
 
-    # ------------------------------------------------------------------
-    # Diagnostics
-    # ------------------------------------------------------------------
     def option_schema(self) -> pd.DataFrame:
         return self._timed_query(
             f"DESCRIBE SELECT * FROM {self._option_rel_name}",
@@ -512,9 +497,6 @@ class OptionGammaProcessor:
         """
         return self._timed_query(sql, fetch="df")
 
-    # ------------------------------------------------------------------
-    # Fetch materialized views
-    # ------------------------------------------------------------------
     def fetch_clean_options(
         self,
         limit: Optional[int] = None,
@@ -566,9 +548,6 @@ class OptionGammaProcessor:
             self._save_df(df, filename)
         return df
 
-    # ------------------------------------------------------------------
-    # Aggregations
-    # ------------------------------------------------------------------
     def aggregate_underlying_daily(
         self,
         save: bool = False,
@@ -705,9 +684,6 @@ class OptionGammaProcessor:
             self._save_df(df, filename)
         return df
 
-    # ------------------------------------------------------------------
-    # Direct exports without pandas materialization
-    # ------------------------------------------------------------------
     def export_query_to_parquet(self, sql: str, output_path: PathLike) -> Path:
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -755,9 +731,6 @@ class OptionGammaProcessor:
         """
         return self.export_query_to_parquet(sql, output_path)
 
-    # ------------------------------------------------------------------
-    # Convenience runners
-    # ------------------------------------------------------------------
     def run_diagnostics(self) -> dict[str, pd.DataFrame | int]:
         out: dict[str, pd.DataFrame | int] = {
             "option_schema": self.option_schema(),

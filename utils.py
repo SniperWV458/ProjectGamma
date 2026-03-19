@@ -1,5 +1,6 @@
 from pathlib import Path
 from typing import Optional
+import pandas as pd
 
 import duckdb
 
@@ -241,4 +242,105 @@ def log_parquet_inventory(
         con.close()
 
     output_file.write_text("\n".join(lines), encoding="utf-8")
+    return output_file
+
+
+def export_secid_crsp_name_mapping(
+    secid_file: str | Path,
+    stocknames_file: str | Path,
+    output_file: str | Path,
+    replace: bool = False,
+    keep_all_name_rows: bool = False,
+) -> Path:
+    secid_file = Path(secid_file)
+    stocknames_file = Path(stocknames_file)
+    output_file = Path(output_file)
+
+    if output_file.exists() and not replace:
+        return output_file
+
+    secid_df = pd.read_parquet(secid_file).copy()
+    stock_df = pd.read_parquet(stocknames_file).copy()
+
+    if secid_df.empty:
+        raise ValueError(f"No rows found in secid file: {secid_file}")
+    if stock_df.empty:
+        raise ValueError(f"No rows found in stocknames file: {stocknames_file}")
+
+    secid_df["permno"] = pd.to_numeric(secid_df["permno"], errors="coerce").astype("Int64")
+    secid_df["secid"] = pd.to_numeric(secid_df["secid"], errors="coerce").astype("Int64")
+    stock_df["permno"] = pd.to_numeric(stock_df["permno"], errors="coerce").astype("Int64")
+
+    for c in ["namedt", "nameenddt", "st_date", "end_date"]:
+        if c in stock_df.columns:
+            stock_df[c] = pd.to_datetime(stock_df[c], errors="coerce")
+
+    stock_cols = [
+        "permno",
+        "permco",
+        "ticker",
+        "ncusip",
+        "cusip",
+        "comnam",
+        "siccd",
+        "shrcd",
+        "exchcd",
+        "hexcd",
+        "shrcls",
+        "namedt",
+        "nameenddt",
+        "st_date",
+        "end_date",
+    ]
+    stock_cols = [c for c in stock_cols if c in stock_df.columns]
+    stock_df = stock_df[stock_cols].copy()
+
+    if not keep_all_name_rows:
+        sort_cols = [c for c in ["end_date", "nameenddt", "st_date", "namedt"] if c in stock_df.columns]
+
+        if sort_cols:
+            stock_df = (
+                stock_df.sort_values(
+                    by=["permno"] + sort_cols,
+                    ascending=[True] + [False] * len(sort_cols),
+                    na_position="last",
+                )
+                .drop_duplicates(subset=["permno"], keep="first")
+                .reset_index(drop=True)
+            )
+        else:
+            stock_df = stock_df.drop_duplicates(subset=["permno"], keep="first").reset_index(drop=True)
+
+    merged = secid_df.merge(
+        stock_df,
+        on="permno",
+        how="left",
+        validate="many_to_one" if not keep_all_name_rows else "many_to_many",
+    )
+
+    preferred_order = [
+        "secid",
+        "permno",
+        "link_method",
+        "permco",
+        "ticker",
+        "comnam",
+        "ncusip",
+        "cusip",
+        "siccd",
+        "shrcd",
+        "exchcd",
+        "hexcd",
+        "shrcls",
+        "namedt",
+        "nameenddt",
+        "st_date",
+        "end_date",
+    ]
+    ordered_cols = [c for c in preferred_order if c in merged.columns] + [c for c in merged.columns if c not in preferred_order]
+    merged = merged[ordered_cols].sort_values(["secid", "permno"], na_position="last").reset_index(drop=True)
+
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    merged.to_csv(output_file, index=False)
+
     return output_file
