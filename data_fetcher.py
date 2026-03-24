@@ -712,51 +712,6 @@ class DataFetcher:
 
         return output_file
 
-    def export_secids_to_txt(
-            self,
-            parquet_file: Path | str,
-            output_file: Optional[Path | str] = None,
-            secid_col: str = "secid",
-            replace: Optional[bool] = None,
-            sort_values: bool = True,
-            drop_duplicates: bool = True,
-    ) -> Path:
-        replace = self.cfg.replace if replace is None else replace
-        parquet_file = Path(parquet_file)
-
-        if not parquet_file.exists():
-            raise FileNotFoundError(f"Parquet file does not exist: {parquet_file}")
-
-        if output_file is None:
-            output_file = parquet_file.with_suffix(".txt")
-        output_file = Path(output_file)
-
-        if self.exists_and_skip(output_file, replace):
-            return output_file
-
-        con = duckdb.connect()
-        try:
-            df = con.execute(f"""
-                SELECT {secid_col} AS secid
-                FROM read_parquet('{parquet_file.as_posix()}')
-                WHERE {secid_col} IS NOT NULL
-            """).fetchdf()
-        finally:
-            con.close()
-
-        secids = df["secid"].astype("Int64").dropna().astype(int)
-
-        if drop_duplicates:
-            secids = pd.Series(secids.unique())
-
-        if sort_values:
-            secids = secids.sort_values(ignore_index=True)
-
-        output_file.parent.mkdir(parents=True, exist_ok=True)
-        output_file.write_text("\n".join(secids.astype(str).tolist()), encoding="utf-8")
-
-        return output_file
-
     def extract_optionm_secnmd(self, replace: Optional[bool] = None) -> Path:
         output = self.optionm_secnmd_file
         if self.exists_and_skip(output, replace):
@@ -785,65 +740,125 @@ class DataFetcher:
     def build_crsp_optionm_link(self, replace: Optional[bool] = None) -> tuple[Path, Path]:
         output_all = self.crsp_optionm_link_file
         output_dom = self.crsp_optionm_link_dominant_file
-        if output_all.exists() and output_dom.exists() and not (self.cfg.replace if replace is None else replace):
+
+        do_replace = self.cfg.replace if replace is None else replace
+        if output_all.exists() and output_dom.exists() and not do_replace:
             return output_all, output_dom
+
         crsp = pd.read_parquet(self.crsp_id_master_file)
         opt = pd.read_parquet(self.optionm_secnmd_file)
+
+        # Standardize string columns
         for df in (crsp, opt):
             for col in df.columns:
                 if df[col].dtype == object or str(df[col].dtype).startswith("string"):
                     df[col] = df[col].astype("string").str.strip().str.upper()
+
+        # Ensure CRSP has a historical CUSIP source
         if "cusip_hist" not in crsp.columns:
             crsp["cusip_hist"] = crsp["ncusip"]
             if "cusip" in crsp.columns:
                 crsp["cusip_hist"] = crsp["cusip_hist"].fillna(crsp["cusip"])
+
         crsp["cusip8"] = crsp["cusip_hist"].astype("string").str[:8]
+
+        # CUSIP8 link
         crsp_c = crsp[crsp["cusip8"].notna() & (crsp["cusip8"] != "")]
         opt_c = opt[opt["cusip8"].notna() & (opt["cusip8"] != "")]
+
         link_cusip = crsp_c.merge(
             opt_c,
             on="cusip8",
             how="inner",
-
             suffixes=("_crsp", "_opt"),
         ).copy()
+
         link_cusip["link_method"] = "cusip8"
+
+        # Add a unified ticker column
+        if "ticker_crsp" in link_cusip.columns and "ticker_opt" in link_cusip.columns:
+            link_cusip["ticker"] = link_cusip["ticker_crsp"].fillna(link_cusip["ticker_opt"])
+        elif "ticker_crsp" in link_cusip.columns:
+            link_cusip["ticker"] = link_cusip["ticker_crsp"]
+        elif "ticker_opt" in link_cusip.columns:
+            link_cusip["ticker"] = link_cusip["ticker_opt"]
+        else:
+            link_cusip["ticker"] = pd.Series(pd.NA, index=link_cusip.index, dtype="string")
+
         link_cusip = (
             link_cusip
             .sort_values(["permno", "secid", "namedt", "effect_date"])
             .drop_duplicates(subset=["permno", "secid"], keep="first")
             .reset_index(drop=True)
         )
+
         pieces = [link_cusip]
+
+        # Optional ticker fallback
         if self.cfg.include_ticker_fallback:
             crsp_t = crsp[crsp["ticker"].notna() & (crsp["ticker"] != "")]
             opt_t = opt[opt["ticker"].notna() & (opt["ticker"] != "")]
+
             link_ticker = crsp_t.merge(
                 opt_t,
                 on="ticker",
                 how="inner",
                 suffixes=("_crsp", "_opt"),
             ).copy()
+
             link_ticker["link_method"] = "ticker"
+
+            # Ensure unified ticker column exists here too
+            if "ticker" not in link_ticker.columns:
+                if "ticker_crsp" in link_ticker.columns and "ticker_opt" in link_ticker.columns:
+                    link_ticker["ticker"] = link_ticker["ticker_crsp"].fillna(link_ticker["ticker_opt"])
+                elif "ticker_crsp" in link_ticker.columns:
+                    link_ticker["ticker"] = link_ticker["ticker_crsp"]
+                elif "ticker_opt" in link_ticker.columns:
+                    link_ticker["ticker"] = link_ticker["ticker_opt"]
+                else:
+                    link_ticker["ticker"] = pd.Series(pd.NA, index=link_ticker.index, dtype="string")
+
             used = set(zip(link_cusip["permno"], link_cusip["secid"]))
             link_ticker = link_ticker[
                 ~link_ticker.apply(lambda r: (r["permno"], r["secid"]) in used, axis=1)
             ].copy()
+
             link_ticker = (
                 link_ticker
                 .sort_values(["permno", "secid", "namedt", "effect_date"])
                 .drop_duplicates(subset=["permno", "secid"], keep="first")
                 .reset_index(drop=True)
             )
+
             pieces.append(link_ticker)
+
         link = pd.concat(pieces, ignore_index=True, sort=False)
+
+        # Final safeguard: create a single unified ticker column on the concatenated frame
+        ticker_candidates = [c for c in ["ticker", "ticker_crsp", "ticker_opt"] if c in link.columns]
+        if ticker_candidates:
+            link["ticker"] = link[ticker_candidates[0]]
+            for c in ticker_candidates[1:]:
+                link["ticker"] = link["ticker"].fillna(link[c])
+        else:
+            link["ticker"] = pd.Series(pd.NA, index=link.index, dtype="string")
+
+        # Optional: place ticker near the front
+        preferred_front = ["permno", "secid", "ticker", "link_method"]
+        existing_front = [c for c in preferred_front if c in link.columns]
+        other_cols = [c for c in link.columns if c not in existing_front]
+        link = link[existing_front + other_cols]
+
         link["link_priority"] = link["link_method"].map({"cusip8": 1, "ticker": 2}).fillna(99)
+
         dominant = (
             link
             .sort_values(["permno", "link_priority", "namedt", "effect_date"])
             .drop_duplicates(subset=["permno"], keep="first")
             .reset_index(drop=True)
         )
+
         self.write_df(link, output_all, file_type="parquet")
         self.write_df(dominant, output_dom, file_type="parquet")
         return output_all, output_dom
@@ -859,10 +874,30 @@ class DataFetcher:
         top_liquid_file = top_liquid_file or self.crsp_top_liquid_file
         link_file = link_file or self.crsp_optionm_link_dominant_file
         output_file = output_file or self.linked_secids_file
+
         if self.exists_and_skip(output_file, replace):
             return output_file
+
         con = duckdb.connect()
         try:
+            # Inspect schema of the link parquet first
+            schema_df = con.execute(f"""
+                DESCRIBE SELECT * FROM read_parquet('{link_file.as_posix()}')
+            """).fetchdf()
+            cols = set(schema_df["column_name"].tolist())
+
+            # Build a robust ticker expression depending on available columns
+            if "ticker" in cols:
+                ticker_expr = 'CAST("ticker" AS VARCHAR) AS ticker'
+            elif "ticker_crsp" in cols and "ticker_opt" in cols:
+                ticker_expr = 'COALESCE(CAST("ticker_crsp" AS VARCHAR), CAST("ticker_opt" AS VARCHAR)) AS ticker'
+            elif "ticker_crsp" in cols:
+                ticker_expr = 'CAST("ticker_crsp" AS VARCHAR) AS ticker'
+            elif "ticker_opt" in cols:
+                ticker_expr = 'CAST("ticker_opt" AS VARCHAR) AS ticker'
+            else:
+                ticker_expr = 'CAST(NULL AS VARCHAR) AS ticker'
+
             con.execute(f"""
                 COPY (
                     WITH liquid_permnos AS (
@@ -873,10 +908,15 @@ class DataFetcher:
                         SELECT
                             CAST(permno AS BIGINT) AS permno,
                             CAST(secid AS BIGINT) AS secid,
+                            {ticker_expr},
                             link_method
                         FROM read_parquet('{link_file.as_posix()}')
                     )
-                    SELECT DISTINCT l.permno, l.secid, l.link_method
+                    SELECT DISTINCT
+                        l.permno,
+                        l.secid,
+                        l.ticker,
+                        l.link_method
                     FROM links l
                     INNER JOIN liquid_permnos p
                         ON l.permno = p.permno
@@ -887,6 +927,7 @@ class DataFetcher:
             """)
         finally:
             con.close()
+
         return output_file
 
     def fetch_opprcd(
@@ -1147,6 +1188,228 @@ class DataFetcher:
 
         return final_output_file
 
+    def fetch_wrds_signals_raw_plus(
+            self,
+            link_file: Optional[Path] = None,
+            replace: Optional[bool] = None,
+            final_output_file: Optional[Path] = None,
+    ) -> Path:
+        replace = self.cfg.replace if replace is None else replace
+        link_file = link_file or self.linked_secids_file
+        final_output_file = final_output_file or self.path(
+            f"wrds_signals_raw_plus_linked_{self.cfg.start_year}_{self.cfg.end_year}.parquet"
+        )
+
+        if self.exists_and_skip(final_output_file, replace):
+            return final_output_file
+
+        link_df = pd.read_parquet(link_file)
+
+        required_cols = {"permno", "secid", "ticker"}
+        missing = required_cols - set(link_df.columns)
+        if missing:
+            raise ValueError(f"link_file missing required columns: {sorted(missing)}")
+
+        link_df = link_df[["permno", "secid", "ticker"]].copy()
+        link_df = link_df.dropna(subset=["permno"])
+        link_df["permno"] = link_df["permno"].astype("int64")
+
+        # Keep one row per permno for the merge back
+        link_df = (
+            link_df.sort_values(["permno", "secid"])
+            .drop_duplicates(subset=["permno"], keep="first")
+            .reset_index(drop=True)
+        )
+
+        permno_list = sorted(link_df["permno"].unique().tolist())
+        if not permno_list:
+            raise ValueError("No PERMNOs found in linked file.")
+
+        chunk_dir = self.path("wrds_signals_raw_plus_chunks")
+        chunk_dir.mkdir(parents=True, exist_ok=True)
+
+        # ------------------------------------------------------------
+        # Discover schema from WRDS catalog
+        # ------------------------------------------------------------
+        self.connect()
+        db = self.db
+
+        meta_sql = """
+            select
+                column_name,
+                data_type,
+                ordinal_position
+            from information_schema.columns
+            where table_schema = 'wrdsapps'
+              and table_name = 'signals_raw_plus'
+            order by ordinal_position
+        """
+        meta = db.raw_sql(meta_sql)
+        self.close()
+
+        if meta.empty:
+            raise ValueError("Could not retrieve schema for wrdsapps.signals_raw_plus")
+
+        cols = meta["column_name"].astype(str).tolist()
+        cols_lower = {c.lower(): c for c in cols}
+
+        if "permno" not in cols_lower:
+            raise ValueError("wrdsapps.signals_raw_plus does not contain a permno column")
+
+        # Try common date column names
+        date_candidates = ["date", "datadate", "signal_date", "month_end_date", "fdate"]
+        date_col = next((cols_lower[c] for c in date_candidates if c in cols_lower), None)
+        if date_col is None:
+            raise ValueError(
+                f"Could not identify date column in wrdsapps.signals_raw_plus. "
+                f"Available columns: {cols[:20]}{'...' if len(cols) > 20 else ''}"
+            )
+
+        permno_col = cols_lower["permno"]
+
+        # Exclude identifiers and administrative fields; fetch everything else as factors
+        exclude_lower = {
+            permno_col.lower(),
+            date_col.lower(),
+            "ticker",
+            "secid",
+            "gvkey",
+            "cusip",
+            "ncusip",
+            "iid",
+            "siccd",
+            "namedt",
+            "nameendt",
+            "linkdt",
+            "linkenddt",
+        }
+
+        factor_cols = [c for c in cols if c.lower() not in exclude_lower]
+        if not factor_cols:
+            raise ValueError("No factor columns detected in wrdsapps.signals_raw_plus")
+
+        # ------------------------------------------------------------
+        # Save local link table once for DuckDB merge later
+        # ------------------------------------------------------------
+        link_map_file = chunk_dir / "_permno_secid_ticker_map.parquet"
+        self.write_df(link_df, link_map_file, file_type="parquet")
+
+        tasks = []
+        permno_ranges = list(range(0, len(permno_list), self.cfg.crsp_permno_chunk_size))
+
+        for year, month in self.iter_months():
+            for chunk_idx, start_i in enumerate(permno_ranges):
+                end_i = min(start_i + self.cfg.crsp_permno_chunk_size, len(permno_list))
+                sub = permno_list[start_i:end_i]
+                chunk_file = chunk_dir / f"signals_raw_plus_{year}_{month:02d}_chunk_{chunk_idx:05d}.parquet"
+                tasks.append((year, month, chunk_idx, sub, chunk_file))
+
+        select_cols_sql = ",\n            ".join(
+            [permno_col, date_col] + factor_cols
+        )
+
+        def worker_fn(db, task, results, errors, lock):
+            year, month, chunk_idx, sub, chunk_file = task
+
+            if self.exists_and_skip(chunk_file, replace):
+                with lock:
+                    results.append((year, month, chunk_idx, "skipped"))
+                return
+
+            start_date = pd.Timestamp(year=year, month=month, day=1)
+            end_date = start_date + pd.offsets.MonthEnd(1)
+            in_clause = self.sql_in_clause(sub)
+
+            sql = f"""
+                select
+                    {select_cols_sql}
+                from wrdsapps.signals_raw_plus
+                where {permno_col} in ({in_clause})
+                  and {date_col} between '{start_date.date()}' and '{end_date.date()}'
+            """
+
+            df_part = db.raw_sql(sql, date_cols=[date_col])
+
+            # Standardize id/date names for downstream combine
+            rename_map = {}
+            if permno_col != "permno":
+                rename_map[permno_col] = "permno"
+            if date_col != "date":
+                rename_map[date_col] = "date"
+            if rename_map:
+                df_part = df_part.rename(columns=rename_map)
+
+            # Merge local secid/ticker here so each chunk is already aligned
+            if not df_part.empty:
+                df_part["permno"] = df_part["permno"].astype("int64")
+                df_part = df_part.merge(link_df, on="permno", how="left")
+
+            self.write_df(df_part, chunk_file, file_type="parquet")
+
+            with lock:
+                results.append((year, month, chunk_idx, "saved"))
+
+        self._run_tasks_with_connection_pool(
+            tasks=tasks,
+            worker_fn=worker_fn,
+            desc="signals_raw_plus month-chunks",
+            n_connections=5,
+        )
+
+        if self.exists_and_skip(final_output_file, replace):
+            return final_output_file
+
+        chunk_files = sorted(chunk_dir.glob("signals_raw_plus_*.parquet"))
+        if not chunk_files:
+            raise FileNotFoundError(f"No chunk parquet files found in {chunk_dir}")
+
+        pq_glob = chunk_dir / "signals_raw_plus_*.parquet"
+
+        # ------------------------------------------------------------
+        # Build final parquet with stable typing
+        # ------------------------------------------------------------
+        con = duckdb.connect()
+        try:
+            # Inspect one chunk to get factor column names actually written
+            sample_cols = pd.read_parquet(chunk_files[0]).columns.tolist()
+
+            base_cols = ["secid", "permno", "ticker", "date"]
+            factor_cols_final = [c for c in sample_cols if c not in base_cols]
+
+            # Cast factors to DOUBLE by default; this is usually correct for signal tables
+            factor_cast_sql = ",\n                        ".join(
+                [f'CAST("{c}" AS DOUBLE) AS "{c}"' for c in factor_cols_final]
+            )
+
+            select_sql = f"""
+                SELECT
+                    CAST(secid AS BIGINT) AS secid,
+                    CAST(permno AS BIGINT) AS permno,
+                    CAST(ticker AS VARCHAR) AS ticker,
+                    CAST(date AS DATE) AS date
+                    {"," if factor_cast_sql else ""}
+                    {factor_cast_sql}
+                FROM read_parquet('{pq_glob.as_posix()}')
+                ORDER BY date, permno, secid
+            """
+
+            con.execute(f"""
+                COPY (
+                    {select_sql}
+                )
+                TO '{final_output_file.as_posix()}'
+                (FORMAT PARQUET, COMPRESSION '{self.cfg.compression}')
+            """)
+        finally:
+            con.close()
+
+        if not self.cfg.keep_intermediate_csv:
+            for f in chunk_files:
+                f.unlink(missing_ok=True)
+            link_map_file.unlink(missing_ok=True)
+
+        return final_output_file
+
     def summarize_link_coverage(self) -> None:
         link = pd.read_parquet(self.crsp_optionm_link_dominant_file)
         print("rows:", len(link))
@@ -1154,17 +1417,6 @@ class DataFetcher:
         print("unique secid:", link["secid"].nunique())
         if "link_method" in link.columns:
             print(link["link_method"].value_counts(dropna=False))
-
-    def validate_required_files(self, files: Optional[list[Path]] = None) -> None:
-        files = files or [
-            self.crsp_stocknames_file,
-            self.crsp_id_master_file,
-            self.optionm_secnmd_file,
-            self.crsp_optionm_link_dominant_file,
-        ]
-        missing = [str(f) for f in files if not f.exists()]
-        if missing:
-            raise FileNotFoundError("Missing required files:\n" + "\n".join(missing))
 
     def run_identifier_pipeline(self) -> None:
         self.fetch_crsp_stocknames()

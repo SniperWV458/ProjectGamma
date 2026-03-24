@@ -344,3 +344,63 @@ def export_secid_crsp_name_mapping(
     merged.to_csv(output_file, index=False)
 
     return output_file
+
+def export_ids_to_txt(
+    parquet_file: Path | str,
+    output_file: Optional[Path | str] = None,
+    id_col: str = "secid",
+    replace: bool = False,
+    sort_values: bool = True,
+    drop_duplicates: bool = True,
+) -> Path:
+    parquet_file = Path(parquet_file)
+
+    if not parquet_file.exists():
+        raise FileNotFoundError(f"Parquet file does not exist: {parquet_file}")
+
+    allowed = {"secid", "permno", "ticker"}
+    if id_col not in allowed:
+        raise ValueError(f"id_col must be one of {sorted(allowed)}, got: {id_col}")
+
+    if output_file is None:
+        output_file = parquet_file.with_name(f"{parquet_file.stem}_{id_col}.txt")
+    output_file = Path(output_file)
+
+    if output_file.exists() and not replace:
+        return output_file
+
+    quoted_col = '"' + id_col.replace('"', '""') + '"'
+
+    con = duckdb.connect()
+    try:
+        df = con.execute(f"""
+            SELECT {quoted_col} AS id_value
+            FROM read_parquet('{parquet_file.as_posix()}')
+            WHERE {quoted_col} IS NOT NULL
+        """).fetchdf()
+    finally:
+        con.close()
+
+    s = df["id_value"]
+
+    if id_col in {"secid", "permno"}:
+        s = pd.to_numeric(s, errors="coerce").dropna().astype("Int64")
+        s = s.dropna().astype(int)
+    else:
+        s = (
+            s.astype("string")
+             .str.strip()
+             .replace("", pd.NA)
+             .dropna()
+        )
+
+    if drop_duplicates:
+        s = pd.Series(s.unique())
+
+    if sort_values:
+        s = s.sort_values(ignore_index=True)
+
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    output_file.write_text("\n".join(s.astype(str).tolist()), encoding="utf-8")
+
+    return output_file
