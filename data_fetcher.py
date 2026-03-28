@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Optional, Sequence, Literal
 import threading
 from queue import Queue, Empty
+import time
 
 import duckdb
 import pandas as pd
@@ -142,14 +143,14 @@ class DataFetcher:
             con.close()
         return output_path
 
-    def raw_sql(self, sql: str, date_cols: Optional[list[str]] = None) -> pd.DataFrame:
+    def query_sql(self, sql: str, date_cols: Optional[list[str]] = None) -> pd.DataFrame:
         if self.db is None:
             self.connect()
         return self.db.raw_sql(sql, date_cols=date_cols or [])
 
     def preview_table(self, library: str, table: str, n: int = 5) -> pd.DataFrame:
         q = f"select * from {library}.{table} limit {n}"
-        df = self.raw_sql(q)
+        df = self.query_sql(q)
         print(f"\n=== {library}.{table} ===")
         print(df.columns.tolist())
         print(df.head())
@@ -276,7 +277,7 @@ class DataFetcher:
               and namedt <= '{self.cfg.end_date}'
             order by permno
         """
-        df = self.raw_sql(sql)
+        df = self.query_sql(sql)
         return df["permno"].dropna().astype(int).tolist()
 
     def fetch_crsp_stocknames(self, replace: Optional[bool] = None) -> Path:
@@ -293,7 +294,7 @@ class DataFetcher:
               and nameenddt >= '{self.cfg.start_date}'
               and namedt <= '{self.cfg.end_date}'
         """
-        df = self.raw_sql(sql, date_cols=["namedt", "nameenddt", "st_date", "end_date"])
+        df = self.query_sql(sql, date_cols=["namedt", "nameenddt", "st_date", "end_date"])
         return self.write_df(df, output, file_type="parquet")
 
     def build_crsp_id_master(self, replace: Optional[bool] = None) -> Path:
@@ -729,7 +730,7 @@ class DataFetcher:
             from optionm_all.secnmd
             where effect_date >= '{self.cfg.start_date}'
         """
-        df = self.raw_sql(sql, date_cols=["effect_date"])
+        df = self.query_sql(sql, date_cols=["effect_date"])
         for col in ["cusip", "ticker", "class", "issuer", "issue"]:
             if col in df.columns:
                 df[col] = df[col].astype("string").str.strip().str.upper()
@@ -972,8 +973,6 @@ class DataFetcher:
             "ss_flag",
             "forward_price",
             "expiry_indicator",
-            "root",
-            "suffix",
         ]
 
         tasks = []
@@ -1004,6 +1003,13 @@ class DataFetcher:
                 from optionm_all.{table_name}
                 where secid in ({in_clause})
                   and date between '{start_date.date()}' and '{end_date.date()}'
+                  and open_interest > 0
+                  and gamma is not null
+                  and gamma <> 0
+                  and contract_size is not null
+                  and contract_size > 0
+                  and cfadj is not null
+                  and cfadj > 0
             """
 
             df_part = db.raw_sql(sql, date_cols=["date", "exdate"])
@@ -1016,7 +1022,7 @@ class DataFetcher:
             tasks=tasks,
             worker_fn=worker_fn,
             desc="opprcd month-chunks",
-            n_connections=5,
+            n_connections=1,
         )
 
         if self.exists_and_skip(final_output_file, replace):
@@ -1051,9 +1057,7 @@ class DataFetcher:
                         CAST(contract_size AS DOUBLE) AS contract_size,
                         CAST(ss_flag AS INTEGER) AS ss_flag,
                         CAST(forward_price AS DOUBLE) AS forward_price,
-                        expiry_indicator,
-                        root,
-                        suffix
+                        expiry_indicator
                     FROM read_parquet('{pq_glob.as_posix()}')
                     ORDER BY date, secid, exdate, optionid
                 )

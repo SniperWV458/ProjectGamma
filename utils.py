@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Union
 import pandas as pd
 
 import duckdb
@@ -404,3 +404,237 @@ def export_ids_to_txt(
     output_file.write_text("\n".join(s.astype(str).tolist()), encoding="utf-8")
 
     return output_file
+
+
+def optionmetrics_csv_to_parquet(
+    csv_path: Union[str, Path],
+    parquet_path: Optional[Union[str, Path]] = None,
+    *,
+    compression: str = "zstd",
+    parse_dates: bool = True,
+    low_memory: bool = False,
+) -> Path:
+    csv_path = Path(csv_path)
+    if parquet_path is None:
+        parquet_path = csv_path.with_suffix(".parquet")
+    parquet_path = Path(parquet_path)
+
+    expected_columns = [
+        "secid",
+        "date",
+        "symbol",
+        "symbol_flag",
+        "exdate",
+        "last_date",
+        "cp_flag",
+        "strike_price",
+        "best_bid",
+        "best_offer",
+        "volume",
+        "open_interest",
+        "impl_volatility",
+        "delta",
+        "gamma",
+        "vega",
+        "theta",
+        "optionid",
+        "cfadj",
+        "am_settlement",
+        "contract_size",
+        "ss_flag",
+        "forward_price",
+        "expiry_indicator",
+        "root",
+        "suffix",
+        "cusip",
+        "ticker",
+        "sic",
+        "index_flag",
+        "exchange_d",
+        "class",
+        "issue_type",
+        "industry_group",
+        "issuer",
+        "div_convention",
+        "exercise_style",
+        "am_set_flag",
+    ]
+
+    dtype_map = {
+        "secid": "Int64",
+        "symbol": "string",
+        "symbol_flag": "string",
+        "cp_flag": "string",
+        "strike_price": "float64",
+        "best_bid": "float64",
+        "best_offer": "float64",
+        "volume": "float64",
+        "open_interest": "float64",
+        "impl_volatility": "float64",
+        "delta": "float64",
+        "gamma": "float64",
+        "vega": "float64",
+        "theta": "float64",
+        "optionid": "Int64",
+        "cfadj": "float64",
+        "am_settlement": "float64",
+        "contract_size": "float64",
+        "ss_flag": "string",
+        "forward_price": "float64",
+        "expiry_indicator": "string",
+        "root": "string",
+        "suffix": "string",
+        "cusip": "string",
+        "ticker": "string",
+        "sic": "Int64",
+        "index_flag": "string",
+        "exchange_d": "string",
+        "class": "string",
+        "issue_type": "string",
+        "industry_group": "string",
+        "issuer": "string",
+        "div_convention": "string",
+        "exercise_style": "string",
+        "am_set_flag": "string",
+    }
+
+    date_cols = ["date", "exdate", "last_date"]
+
+    df = pd.read_csv(
+        csv_path,
+        dtype=dtype_map,
+        usecols=expected_columns,
+        low_memory=low_memory,
+    )
+
+    missing = [c for c in expected_columns if c not in df.columns]
+    if missing:
+        raise ValueError(f"Missing expected columns: {missing}")
+
+    if parse_dates:
+        for col in date_cols:
+            df[col] = pd.to_datetime(df[col], errors="coerce")
+
+    parquet_path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(parquet_path, index=False, compression=compression)
+
+    return parquet_path
+
+
+def attach_permno_to_underlying_gex(
+    link_file: str | Path,
+    underlying_file: str | Path,
+    output_file: str | Path | None = None,
+    how: str = "left",
+    validate: bool = True,
+) -> pd.DataFrame:
+    link_file = Path(link_file)
+    underlying_file = Path(underlying_file)
+
+    if output_file is None:
+        output_file = underlying_file.with_name(
+            underlying_file.stem + "_with_permno.parquet"
+        )
+    else:
+        output_file = Path(output_file)
+
+    # Read files
+    link_df = pd.read_parquet(link_file)
+    underlying_df = pd.read_parquet(underlying_file)
+
+    # Keep only the mapping columns needed
+    mapping = link_df[["secid", "permno"]].copy()
+
+    # Standardize dtype a bit to reduce merge surprises
+    mapping["secid"] = pd.to_numeric(mapping["secid"], errors="coerce").astype("Int64")
+    mapping["permno"] = pd.to_numeric(mapping["permno"], errors="coerce").astype("Int64")
+    underlying_df["secid"] = pd.to_numeric(underlying_df["secid"], errors="coerce").astype("Int64")
+
+    if validate:
+        # Check whether one secid maps to multiple permnos
+        dup_map = (
+            mapping.dropna(subset=["secid", "permno"])
+            .groupby("secid")["permno"]
+            .nunique()
+        )
+        bad = dup_map[dup_map > 1]
+        if not bad.empty:
+            raise ValueError(
+                f"Found secid values mapping to multiple permnos. "
+                f"Example bad secids: {bad.index.tolist()[:10]}"
+            )
+
+    # Deduplicate mapping in case repeated identical secid-permno rows exist
+    mapping = mapping.drop_duplicates(subset=["secid"])
+
+    # Merge
+    merged = underlying_df.merge(mapping, on="secid", how=how)
+
+    # Put permno near secid for readability
+    cols = merged.columns.tolist()
+    if "permno" in cols:
+        cols.insert(cols.index("secid") + 1, cols.pop(cols.index("permno")))
+        merged = merged[cols]
+
+    # Save
+    merged.to_parquet(output_file, index=False)
+
+    # Diagnostics
+    matched = merged["permno"].notna().sum()
+    total = len(merged)
+    unique_secid_in_underlying = merged["secid"].nunique(dropna=True)
+    unique_secid_matched = merged.loc[merged["permno"].notna(), "secid"].nunique(dropna=True)
+
+    print(f"Saved merged file to: {output_file}")
+    print(f"Rows in underlying file: {total}")
+    print(f"Rows with matched permno: {matched} / {total} ({matched / total:.2%})")
+    print(f"Unique secid in underlying: {unique_secid_in_underlying}")
+    print(f"Unique secid matched: {unique_secid_matched}")
+
+    return merged
+
+
+def extract_crsp_rows_for_linked_permnos(
+    link_file: str | Path,
+    crsp_file: str | Path,
+    output_file: str | Path | None = None,
+    validate: bool = True,
+) -> pd.DataFrame:
+    link_file = Path(link_file)
+    crsp_file = Path(crsp_file)
+
+    if output_file is None:
+        output_file = crsp_file.with_name(
+            crsp_file.stem + "_linked_permnos.parquet"
+        )
+    else:
+        output_file = Path(output_file)
+
+    # Read linked permnos
+    link_df = pd.read_parquet(link_file, columns=["permno"])
+    link_df["permno"] = pd.to_numeric(link_df["permno"], errors="coerce").astype("Int64")
+
+    permno_set = set(link_df["permno"].dropna().unique().tolist())
+    if not permno_set:
+        raise ValueError("No valid permno values found in link file.")
+
+    # Read CRSP and filter
+    crsp_df = pd.read_parquet(crsp_file)
+    crsp_df["permno"] = pd.to_numeric(crsp_df["permno"], errors="coerce").astype("Int64")
+
+    filtered = crsp_df[crsp_df["permno"].isin(permno_set)].copy()
+
+    # Save
+    filtered.to_parquet(output_file, index=False)
+
+    if validate:
+        print(f"Saved filtered CRSP file to: {output_file}")
+        print(f"Input linked permnos: {len(permno_set)}")
+        print(f"Filtered CRSP rows: {len(filtered)}")
+        print(f"Matched CRSP permnos: {filtered['permno'].nunique(dropna=True)}")
+        print(
+            f"Date range: {filtered['date'].min()} to {filtered['date'].max()}"
+            if not filtered.empty else "Filtered result is empty."
+        )
+
+    return filtered
