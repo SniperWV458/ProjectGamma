@@ -1,17 +1,29 @@
 from __future__ import annotations
 
+import json
+import warnings
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Optional, Literal, Any
-import json
-import warnings
-import matplotlib.pyplot as plt
-import statsmodels.api as sm
-from statsmodels.stats.sandwich_covariance import cov_hac
-from scipy import stats
 
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import statsmodels.api as sm
+from scipy import stats
+from sklearn.impute import SimpleImputer
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import (
+    roc_auc_score,
+    accuracy_score,
+    precision_score,
+    recall_score,
+    f1_score,
+    brier_score_loss,
+    roc_curve,
+)
+from sklearn.pipeline import Pipeline
+from statsmodels.stats.sandwich_covariance import cov_hac
 
 
 # ============================================================
@@ -45,6 +57,40 @@ class FactorSpec:
     lag_months: int = 0
     forward_fill: bool = False
     description: Optional[str] = None
+
+    source_id_type: Literal["permno", "ticker", "secid"] = "permno"
+    base_merge_id_col: str | None = None
+
+
+@dataclass
+class IdentifierConfig:
+    """
+    Identifier mapping configuration.
+
+    Used when factor sources are not keyed by permno directly.
+    Example: ticker-based factor files that need to be mapped to permno.
+    """
+    mapping_path: Optional[str | Path] = None
+    mapping_file_type: Optional[Literal["csv", "parquet"]] = None
+
+    permno_col: str = "permno"
+    secid_col: str = "secid"
+    ticker_col: str = "ticker"
+    cusip_col: str = "cusip"
+    ncusip_col: str = "ncusip"
+
+    # optional metadata columns
+    permco_col: Optional[str] = "permco"
+    comnam_col: Optional[str] = "comnam"
+    siccd_col: Optional[str] = "siccd"
+    link_method_col: Optional[str] = "link_method"
+
+    # string normalization
+    uppercase_ticker: bool = True
+    strip_ticker_whitespace: bool = True
+
+    # duplicate handling after mapping
+    duplicate_resolution: Literal["first", "last", "drop_ambiguous"] = "drop_ambiguous"
 
 
 @dataclass
@@ -161,6 +207,7 @@ class OutputConfig:
     metadata_name: str = "phase1_metadata.json"
     verbose: bool = True
 
+
 @dataclass
 class RegressionConfig:
     """
@@ -206,6 +253,64 @@ class RegressionConfig:
     save_phase2_plots: bool = True
 
 
+@dataclass
+class ClassificationConfig:
+    """
+    Phase 4 tail-classification settings.
+    """
+
+    enabled: bool = True
+
+    # Targets to classify
+    target_cols: list[str] = field(
+        default_factory=lambda: [
+            "tail_left_fwd_1d",
+            "tail_left_fwd_5d",
+            "tail_abs_fwd_1d",
+        ]
+    )
+
+    # Train/test split by date
+    train_start: Optional[str] = None
+    train_end: Optional[str] = None
+    test_start: Optional[str] = None
+    test_end: Optional[str] = None
+
+    # If explicit split is not supplied, use fraction by sorted unique dates
+    test_size: float = 0.3
+
+    # Minimum rows after filtering
+    min_train_rows: int = 200
+    min_test_rows: int = 100
+
+    # Models to run in first version
+    model_names: list[str] = field(
+        default_factory=lambda: [
+            "logit_l2",
+            "logit_elasticnet",
+        ]
+    )
+
+    # Logistic settings
+    max_iter: int = 2000
+    C: float = 1.0
+    l1_ratio: float = 0.5
+    class_weight: Optional[str] = "balanced"
+
+    # Feature construction
+    use_controls: bool = True
+    control_cols: list[str] = field(default_factory=list)
+    include_factor_interaction: bool = True
+
+    # Missing handling
+    imputer_strategy: str = "median"
+
+    # Output
+    save_phase4_tables: bool = True
+    save_phase4_plots: bool = True
+    top_n_factor_plots: int = 15
+
+
 # ============================================================
 # Main experiment class - Phase 1 only
 # ============================================================
@@ -228,20 +333,24 @@ class GEXCollaborativeEffectExperiment:
     """
 
     def __init__(
-        self,
-        data_config: DataConfig,
-        column_config: ColumnConfig,
-        preprocess_config: PreprocessConfig,
-        target_config: TargetConfig,
-        regression_config: RegressionConfig,
-        output_config: OutputConfig,
+            self,
+            data_config: DataConfig,
+            column_config: ColumnConfig,
+            preprocess_config: PreprocessConfig,
+            target_config: TargetConfig,
+            regression_config: RegressionConfig,
+            classification_config: ClassificationConfig,
+            output_config: OutputConfig,
+            identifier_config: Optional[IdentifierConfig] = None,
     ) -> None:
         self.data_config = data_config
         self.column_config = column_config
         self.preprocess_config = preprocess_config
         self.target_config = target_config
         self.regression_config = regression_config
+        self.classification_config = classification_config
         self.output_config = output_config
+        self.identifier_config = identifier_config or IdentifierConfig()
 
         self.output_dir = Path(self.output_config.output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -256,6 +365,8 @@ class GEXCollaborativeEffectExperiment:
         self.factor_cols_selected = []
         self.factor_name_map = {}
 
+        self.identifier_mapping: Optional[pd.DataFrame] = None
+
         self.metadata: dict[str, Any] = {}
         self.artifacts: dict[str, Any] = {}
 
@@ -264,9 +375,9 @@ class GEXCollaborativeEffectExperiment:
     # --------------------------------------------------------
 
     def run_phase1(
-        self,
-        factor_specs: Optional[list[FactorSpec]] = None,
-        selected_factors: Optional[list[str]] = None,
+            self,
+            factor_specs: Optional[list[FactorSpec]] = None,
+            selected_factors: Optional[list[str]] = None,
     ) -> dict[str, Any]:
         """
         Run Phase 1 only:
@@ -361,7 +472,8 @@ class GEXCollaborativeEffectExperiment:
             if "prc_abs" in crsp_df.columns:
                 crsp_df = crsp_df[crsp_df["prc_abs"] >= self.data_config.min_abs_price].copy()
             elif self.column_config.crsp_price_col in crsp_df.columns:
-                crsp_df = crsp_df[crsp_df[self.column_config.crsp_price_col].abs() >= self.data_config.min_abs_price].copy()
+                crsp_df = crsp_df[
+                    crsp_df[self.column_config.crsp_price_col].abs() >= self.data_config.min_abs_price].copy()
 
         # Deduplicate before merge
         gex_df = self._deduplicate_key(gex_df)
@@ -400,6 +512,200 @@ class GEXCollaborativeEffectExperiment:
         )
 
         return panel
+
+    def load_identifier_mapping(self) -> pd.DataFrame:
+        """
+        Load identifier mapping file for translating ticker/secid to permno.
+        Expected columns include at least permno and ticker when ticker mapping is needed.
+        """
+        if self.identifier_mapping is not None:
+            return self.identifier_mapping
+
+        cfg = self.identifier_config
+        if cfg.mapping_path is None:
+            raise ValueError(
+                "Identifier mapping is required but IdentifierConfig.mapping_path is None."
+            )
+
+        path = Path(cfg.mapping_path)
+        file_type = cfg.mapping_file_type or self._infer_file_type(path)
+        df = self._read_file(path, file_type)
+
+        required = [cfg.permno_col]
+        if cfg.ticker_col:
+            required.append(cfg.ticker_col)
+
+        missing = [c for c in required if c not in df.columns]
+        if missing:
+            raise ValueError(
+                f"Identifier mapping file is missing required columns: {missing}"
+            )
+
+        df = df.copy()
+
+        # Standardize core identifier columns
+        if cfg.permno_col in df.columns:
+            df[cfg.permno_col] = pd.to_numeric(df[cfg.permno_col], errors="coerce").astype("Int64")
+
+        if cfg.secid_col and cfg.secid_col in df.columns:
+            df[cfg.secid_col] = pd.to_numeric(df[cfg.secid_col], errors="coerce").astype("Int64")
+
+        if cfg.ticker_col and cfg.ticker_col in df.columns:
+            df[cfg.ticker_col] = self._normalize_ticker_series(df[cfg.ticker_col])
+
+        # Keep only relevant columns
+        keep_cols = [
+            c for c in [
+                cfg.permno_col,
+                cfg.secid_col,
+                cfg.ticker_col,
+                cfg.cusip_col,
+                cfg.ncusip_col,
+                cfg.permco_col,
+                cfg.comnam_col,
+                cfg.siccd_col,
+                cfg.link_method_col,
+            ]
+            if c is not None and c in df.columns
+        ]
+        df = df[keep_cols].copy()
+
+        self.identifier_mapping = df
+        return df
+
+    def _normalize_ticker_series(self, s: pd.Series) -> pd.Series:
+        out = s.astype(str).str.strip()
+
+        # common bad placeholders
+        out = out.replace({
+            "": np.nan,
+            "nan": np.nan,
+            "None": np.nan,
+            "null": np.nan,
+            "NA": np.nan,
+            "N/A": np.nan,
+        })
+
+        if self.identifier_config.strip_ticker_whitespace:
+            out = out.str.strip()
+
+        if self.identifier_config.uppercase_ticker:
+            out = out.str.upper()
+
+        return out
+
+    def _map_source_identifier_to_permno(
+            self,
+            df: pd.DataFrame,
+            spec: FactorSpec,
+    ) -> pd.DataFrame:
+        """
+        Translate source identifier to permno when source_id_type != permno.
+
+        Supported:
+        - ticker -> permno
+        - secid -> permno
+        """
+        out = df.copy()
+        source_col = spec.id_col
+        target_col = self.column_config.id_col
+
+        if spec.source_id_type == "permno":
+            out[source_col] = pd.to_numeric(out[source_col], errors="coerce").astype("Int64")
+            if source_col != target_col:
+                out = out.rename(columns={source_col: target_col})
+            return out
+
+        mapping = self.load_identifier_mapping()
+        cfg = self.identifier_config
+
+        if spec.source_id_type == "ticker":
+            if cfg.ticker_col not in mapping.columns:
+                raise ValueError(
+                    f"Mapping file does not contain ticker column '{cfg.ticker_col}'."
+                )
+
+            out[source_col] = self._normalize_ticker_series(out[source_col])
+
+            map_df = mapping[[cfg.ticker_col, cfg.permno_col]].dropna().copy()
+
+            # resolve duplicate ticker -> permno mappings
+            dup_count = map_df.duplicated([cfg.ticker_col], keep=False).sum()
+            if dup_count > 0:
+                if cfg.duplicate_resolution == "first":
+                    map_df = map_df.drop_duplicates(subset=[cfg.ticker_col], keep="first")
+                elif cfg.duplicate_resolution == "last":
+                    map_df = map_df.drop_duplicates(subset=[cfg.ticker_col], keep="last")
+                elif cfg.duplicate_resolution == "drop_ambiguous":
+                    counts = map_df.groupby(cfg.ticker_col)[cfg.permno_col].nunique()
+                    good_tickers = counts[counts == 1].index
+                    map_df = map_df[map_df[cfg.ticker_col].isin(good_tickers)].copy()
+                    map_df = map_df.drop_duplicates(subset=[cfg.ticker_col], keep="first")
+                else:
+                    raise ValueError(
+                        f"Unsupported duplicate_resolution '{cfg.duplicate_resolution}'."
+                    )
+
+            out = out.merge(
+                map_df,
+                how="left",
+                left_on=source_col,
+                right_on=cfg.ticker_col,
+            )
+
+            out = out.rename(columns={cfg.permno_col: target_col})
+            drop_cols = [c for c in [cfg.ticker_col] if c in out.columns and c != source_col]
+            if drop_cols:
+                out = out.drop(columns=drop_cols)
+
+            out[target_col] = pd.to_numeric(out[target_col], errors="coerce").astype("Int64")
+            return out
+
+        if spec.source_id_type == "secid":
+            if cfg.secid_col not in mapping.columns:
+                raise ValueError(
+                    f"Mapping file does not contain secid column '{cfg.secid_col}'."
+                )
+
+            out[source_col] = pd.to_numeric(out[source_col], errors="coerce").astype("Int64")
+
+            map_df = mapping[[cfg.secid_col, cfg.permno_col]].dropna().copy()
+
+            dup_count = map_df.duplicated([cfg.secid_col], keep=False).sum()
+            if dup_count > 0:
+                if cfg.duplicate_resolution == "first":
+                    map_df = map_df.drop_duplicates(subset=[cfg.secid_col], keep="first")
+                elif cfg.duplicate_resolution == "last":
+                    map_df = map_df.drop_duplicates(subset=[cfg.secid_col], keep="last")
+                elif cfg.duplicate_resolution == "drop_ambiguous":
+                    counts = map_df.groupby(cfg.secid_col)[cfg.permno_col].nunique()
+                    good_secids = counts[counts == 1].index
+                    map_df = map_df[map_df[cfg.secid_col].isin(good_secids)].copy()
+                    map_df = map_df.drop_duplicates(subset=[cfg.secid_col], keep="first")
+                else:
+                    raise ValueError(
+                        f"Unsupported duplicate_resolution '{cfg.duplicate_resolution}'."
+                    )
+
+            out = out.merge(
+                map_df,
+                how="left",
+                left_on=source_col,
+                right_on=cfg.secid_col,
+            )
+
+            out = out.rename(columns={cfg.permno_col: target_col})
+            drop_cols = [c for c in [cfg.secid_col] if c in out.columns and c != source_col]
+            if drop_cols:
+                out = out.drop(columns=drop_cols)
+
+            out[target_col] = pd.to_numeric(out[target_col], errors="coerce").astype("Int64")
+            return out
+
+        raise ValueError(
+            f"Unsupported source_id_type '{spec.source_id_type}'. "
+            f"Supported values: permno, ticker, secid."
+        )
 
     def coerce_factor_columns_to_numeric(
             self,
@@ -447,58 +753,106 @@ class GEXCollaborativeEffectExperiment:
 
     def load_factor_source(self, spec: FactorSpec) -> pd.DataFrame:
         """
-        Load one factor source from csv/parquet or from existing panel metadata.
+        Load one factor source from csv/parquet or from existing panel columns.
+
+        Robustly supports source identifier types:
+        - permno
+        - ticker
+        - secid
+
+        Non-permno identifiers are mapped to permno using identifier mapping.
         """
 
         if spec.already_in_panel:
             if self.base_panel is None:
                 raise ValueError("Base panel must be loaded before using already_in_panel factor specs.")
-            df = self.base_panel.copy()
 
+            df = self.base_panel.copy()
             factor_cols = spec.factor_cols or []
+
             needed = [self.column_config.id_col, self.column_config.date_col] + factor_cols
             missing = [c for c in needed if c not in df.columns]
             if missing:
-                raise ValueError(f"FactorSpec '{spec.name}' refers to in-panel columns that do not exist: {missing}")
+                raise ValueError(
+                    f"FactorSpec '{spec.name}' refers to in-panel columns that do not exist: {missing}"
+                )
 
             return df[needed].copy()
 
         if spec.path is None:
-            raise ValueError(f"FactorSpec '{spec.name}' requires a path when already_in_panel=False.")
+            raise ValueError(
+                f"FactorSpec '{spec.name}' requires a path when already_in_panel=False."
+            )
 
         path = Path(spec.path)
         file_type = spec.file_type or self._infer_file_type(path)
         df = self._read_file(path, file_type)
 
+        # Validate source columns exist before renaming/mapping
+        if spec.id_col not in df.columns:
+            raise ValueError(
+                f"FactorSpec '{spec.name}' id_col '{spec.id_col}' not found in factor file."
+            )
+        if spec.date_col not in df.columns:
+            raise ValueError(
+                f"FactorSpec '{spec.name}' date_col '{spec.date_col}' not found in factor file."
+            )
+
+        # Standardize date column only first; keep original source id column for mapping
         df = self._standardize_date_and_id(
             df,
             id_col=spec.id_col,
             date_col=spec.date_col,
-            out_id_col=self.column_config.id_col,
+            out_id_col=spec.id_col,
             out_date_col=self.column_config.date_col,
             date_format=spec.date_format,
         )
 
-        # If factor cols are not given, infer from numeric columns
+        # Infer/select factor columns
         if spec.factor_cols is None:
-            factor_cols = self.select_numeric_factor_columns(
-                df,
-                exclude_cols=[self.column_config.id_col, self.column_config.date_col],
-            ) if spec.numeric_only else [c for c in df.columns if c not in [self.column_config.id_col, self.column_config.date_col]]
+            if spec.numeric_only:
+                factor_cols = self.select_numeric_factor_columns(
+                    df,
+                    exclude_cols=[spec.id_col, self.column_config.date_col],
+                )
+            else:
+                factor_cols = [
+                    c for c in df.columns
+                    if c not in [spec.id_col, self.column_config.date_col]
+                ]
         else:
             factor_cols = [c for c in spec.factor_cols if c in df.columns]
 
         if not factor_cols:
             raise ValueError(f"No usable factor columns found for FactorSpec '{spec.name}'.")
 
-        keep_cols = [self.column_config.id_col, self.column_config.date_col] + factor_cols
+        keep_cols = [spec.id_col, self.column_config.date_col] + factor_cols
         df = df[keep_cols].copy()
 
+        # Convert factor columns to numeric where possible
         df = self.coerce_factor_columns_to_numeric(df, factor_cols)
-        # Apply optional day lag for daily factors
-        if spec.frequency == "daily" and spec.lag_days != 0:
-            df[self.column_config.date_col] = df[self.column_config.date_col] + pd.to_timedelta(spec.lag_days, unit="D")
 
+        # Map source identifier to base id (permno)
+        df = self._map_source_identifier_to_permno(df, spec)
+
+        # Drop rows that failed mapping
+        before = len(df)
+        df = df[df[self.column_config.id_col].notna()].copy()
+        after = len(df)
+
+        if before > after:
+            warnings.warn(
+                f"FactorSpec '{spec.name}': dropped {before - after} rows because "
+                f"{spec.source_id_type} could not be mapped to permno."
+            )
+
+        # Apply day lag for daily factors
+        if spec.frequency == "daily" and spec.lag_days != 0:
+            df[self.column_config.date_col] = (
+                    df[self.column_config.date_col] + pd.to_timedelta(spec.lag_days, unit="D")
+            )
+
+        # Deduplicate on permno-date after mapping
         df = self._filter_date_range(df, self.column_config.date_col)
         df = self._deduplicate_key(df)
 
@@ -508,7 +862,13 @@ class GEXCollaborativeEffectExperiment:
             df = df.rename(columns=rename_map)
             factor_cols = [rename_map[c] for c in factor_cols]
 
+        # Final selection: now keyed by permno/date
+        keep_cols = [self.column_config.id_col, self.column_config.date_col] + factor_cols
+        df = df[keep_cols].copy()
+
         spec.factor_cols = factor_cols
+        spec.base_merge_id_col = self.column_config.id_col
+
         return df
 
     def merge_factors(self, factor_specs: list[FactorSpec]) -> pd.DataFrame:
@@ -748,9 +1108,9 @@ class GEXCollaborativeEffectExperiment:
     # --------------------------------------------------------
 
     def _read_file(
-        self,
-        path: str | Path,
-        file_type: Optional[str] = None,
+            self,
+            path: str | Path,
+            file_type: Optional[str] = None,
     ) -> pd.DataFrame:
         path = Path(path)
         file_type = file_type or self._infer_file_type(path)
@@ -781,13 +1141,13 @@ class GEXCollaborativeEffectExperiment:
             raise ValueError(f"Missing required columns: {missing}")
 
     def _standardize_date_and_id(
-        self,
-        df: pd.DataFrame,
-        id_col: str,
-        date_col: str,
-        out_id_col: Optional[str] = None,
-        out_date_col: Optional[str] = None,
-        date_format: Optional[str] = None,
+            self,
+            df: pd.DataFrame,
+            id_col: str,
+            date_col: str,
+            out_id_col: Optional[str] = None,
+            out_date_col: Optional[str] = None,
+            date_format: Optional[str] = None,
     ) -> pd.DataFrame:
         out_id_col = out_id_col or id_col
         out_date_col = out_date_col or date_col
@@ -835,58 +1195,83 @@ class GEXCollaborativeEffectExperiment:
     # --------------------------------------------------------
 
     def select_numeric_factor_columns(
-        self,
-        df: pd.DataFrame,
-        exclude_cols: Optional[list[str]] = None,
+            self,
+            df: pd.DataFrame,
+            exclude_cols: Optional[list[str]] = None,
     ) -> list[str]:
         exclude_cols = exclude_cols or []
         num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
         return [c for c in num_cols if c not in exclude_cols]
 
     def _merge_daily_factor_df(
-        self,
-        panel: pd.DataFrame,
-        factor_df: pd.DataFrame,
-        spec: FactorSpec,
+            self,
+            panel: pd.DataFrame,
+            factor_df: pd.DataFrame,
+            spec: FactorSpec,
     ) -> pd.DataFrame:
+        merge_id_col = self.column_config.id_col
+        merge_date_col = self.column_config.date_col
+
+        if merge_id_col not in panel.columns:
+            raise ValueError(
+                f"Base panel missing merge id column '{merge_id_col}' for factor source '{spec.name}'."
+            )
+        if merge_id_col not in factor_df.columns:
+            raise ValueError(
+                f"Factor df missing merge id column '{merge_id_col}' for factor source '{spec.name}'."
+            )
+        if merge_date_col not in panel.columns or merge_date_col not in factor_df.columns:
+            raise ValueError(
+                f"Merge date column '{merge_date_col}' missing for factor source '{spec.name}'."
+            )
+
         overlap = [
             c for c in (spec.factor_cols or [])
-            if c in panel.columns and c not in [self.column_config.id_col, self.column_config.date_col]
+            if c in panel.columns and c not in [merge_id_col, merge_date_col]
         ]
         if overlap:
-            # add spec name suffix to avoid silent overwrite
             rename_map = {c: f"{c}__{spec.name}" for c in overlap}
             factor_df = factor_df.rename(columns=rename_map)
             spec.factor_cols = [rename_map.get(c, c) for c in (spec.factor_cols or [])]
+
+        factor_df[merge_id_col] = pd.to_numeric(factor_df[merge_id_col], errors="coerce").astype("Int64")
+        panel[merge_id_col] = pd.to_numeric(panel[merge_id_col], errors="coerce").astype("Int64")
 
         merged = pd.merge(
             panel,
             factor_df,
             how=spec.merge_how,
-            on=[self.column_config.id_col, self.column_config.date_col],
+            on=[merge_id_col, merge_date_col],
         )
         return merged
 
     def _merge_monthly_factor_df(
-        self,
-        panel: pd.DataFrame,
-        factor_df: pd.DataFrame,
-        spec: FactorSpec,
+            self,
+            panel: pd.DataFrame,
+            factor_df: pd.DataFrame,
+            spec: FactorSpec,
     ) -> pd.DataFrame:
         """
         Monthly merge via effective year-month key after lag_months.
+        Factor df is expected to already be mapped to permno.
         """
-
         p = panel.copy()
         f = factor_df.copy()
 
         date_col = self.column_config.date_col
         id_col = self.column_config.id_col
 
-        p["ym"] = p[date_col].dt.to_period("M")
+        if id_col not in p.columns or id_col not in f.columns:
+            raise ValueError(
+                f"Monthly merge for '{spec.name}' requires '{id_col}' in both panel and factor df."
+            )
 
-        # Monthly factor date -> effective month key
+        p[id_col] = pd.to_numeric(p[id_col], errors="coerce").astype("Int64")
+        f[id_col] = pd.to_numeric(f[id_col], errors="coerce").astype("Int64")
+
+        p["ym"] = p[date_col].dt.to_period("M")
         f["ym"] = f[date_col].dt.to_period("M")
+
         if spec.lag_months != 0:
             f["ym"] = f["ym"] + spec.lag_months
 
@@ -909,10 +1294,6 @@ class GEXCollaborativeEffectExperiment:
             how=spec.merge_how,
             on=[id_col, "ym"],
         )
-
-        if not spec.forward_fill:
-            # even without explicit ffill, month-key merge already maps monthly values
-            pass
 
         p = p.drop(columns=["ym"])
         return p
@@ -1021,10 +1402,10 @@ class GEXCollaborativeEffectExperiment:
     # --------------------------------------------------------
 
     def make_forward_return(
-        self,
-        df: pd.DataFrame,
-        ret_col: str,
-        horizon: int,
+            self,
+            df: pd.DataFrame,
+            ret_col: str,
+            horizon: int,
     ) -> pd.Series:
         """
         Forward compounded return from t+1 to t+h using simple or log returns.
@@ -1063,10 +1444,10 @@ class GEXCollaborativeEffectExperiment:
         return df.groupby(id_col, group_keys=False)[ret_col].apply(func)
 
     def make_forward_realized_vol(
-        self,
-        df: pd.DataFrame,
-        ret_col: str,
-        horizon: int,
+            self,
+            df: pd.DataFrame,
+            ret_col: str,
+            horizon: int,
     ) -> pd.Series:
         id_col = self.column_config.id_col
 
@@ -1087,10 +1468,10 @@ class GEXCollaborativeEffectExperiment:
         return df.groupby(id_col, group_keys=False)[ret_col].apply(_rv)
 
     def make_forward_downside_semivar(
-        self,
-        df: pd.DataFrame,
-        ret_col: str,
-        horizon: int,
+            self,
+            df: pd.DataFrame,
+            ret_col: str,
+            horizon: int,
     ) -> pd.Series:
         id_col = self.column_config.id_col
 
@@ -1112,11 +1493,11 @@ class GEXCollaborativeEffectExperiment:
         return df.groupby(id_col, group_keys=False)[ret_col].apply(_dsv)
 
     def make_forward_tail_indicators(
-        self,
-        df: pd.DataFrame,
-        y_col: str,
-        lower_q: float = 0.05,
-        upper_q: float = 0.95,
+            self,
+            df: pd.DataFrame,
+            y_col: str,
+            lower_q: float = 0.05,
+            upper_q: float = 0.95,
     ) -> dict[str, pd.Series]:
         """
         Construct tail indicators from already-created forward return column.
@@ -1161,10 +1542,10 @@ class GEXCollaborativeEffectExperiment:
     # --------------------------------------------------------
 
     def assign_quantile_bucket_by_date(
-        self,
-        df: pd.DataFrame,
-        col: str,
-        n_buckets: int = 5,
+            self,
+            df: pd.DataFrame,
+            col: str,
+            n_buckets: int = 5,
     ) -> pd.Series:
         date_col = self.column_config.date_col
 
@@ -1191,10 +1572,10 @@ class GEXCollaborativeEffectExperiment:
     # ========================================================
 
     def run_phase2(
-        self,
-        factor_cols: Optional[list[str]] = None,
-        regime_validation_y_cols: Optional[list[str]] = None,
-        interaction_y_cols: Optional[list[str]] = None,
+            self,
+            factor_cols: Optional[list[str]] = None,
+            regime_validation_y_cols: Optional[list[str]] = None,
+            interaction_y_cols: Optional[list[str]] = None,
     ) -> dict[str, Any]:
         """
         Phase 2:
@@ -1235,8 +1616,8 @@ class GEXCollaborativeEffectExperiment:
     # ========================================================
 
     def run_regime_validation(
-        self,
-        y_cols: Optional[list[str]] = None,
+            self,
+            y_cols: Optional[list[str]] = None,
     ) -> dict[str, Any]:
         """
         Validate that GEX behaves more like a risk/dispersion regime variable
@@ -1333,9 +1714,9 @@ class GEXCollaborativeEffectExperiment:
     # ========================================================
 
     def run_interaction_regression(
-        self,
-        factor_cols: Optional[list[str]] = None,
-        y_cols: Optional[list[str]] = None,
+            self,
+            factor_cols: Optional[list[str]] = None,
+            y_cols: Optional[list[str]] = None,
     ) -> dict[str, Any]:
         """
         For each factor F and each outcome Y, run cross-sectional regression:
@@ -1391,7 +1772,8 @@ class GEXCollaborativeEffectExperiment:
                 if factor_z_col is None:
                     continue
 
-                work = df[[self.column_config.id_col, self.column_config.date_col, y_col, gex_z_col, factor_z_col] + controls].copy()
+                work = df[[self.column_config.id_col, self.column_config.date_col, y_col, gex_z_col,
+                           factor_z_col] + controls].copy()
                 work["interaction"] = work[gex_z_col] * work[factor_z_col]
 
                 x_cols = [gex_z_col, factor_z_col, "interaction"] + controls
@@ -1468,12 +1850,12 @@ class GEXCollaborativeEffectExperiment:
     # ========================================================
 
     def run_fama_macbeth(
-        self,
-        df: pd.DataFrame,
-        y_col: str,
-        x_cols: list[str],
-        min_obs_per_date: Optional[int] = None,
-        nw_lags: Optional[int] = None,
+            self,
+            df: pd.DataFrame,
+            y_col: str,
+            x_cols: list[str],
+            min_obs_per_date: Optional[int] = None,
+            nw_lags: Optional[int] = None,
     ) -> dict[str, Any]:
         """
         Run daily cross-sectional OLS, then average slopes over time.
@@ -1587,8 +1969,8 @@ class GEXCollaborativeEffectExperiment:
         }
 
     def summarize_fama_macbeth_results(
-        self,
-        reg_res: dict[str, Any],
+            self,
+            reg_res: dict[str, Any],
     ) -> pd.DataFrame:
         """
         Return a standard tidy summary table.
@@ -1668,12 +2050,12 @@ class GEXCollaborativeEffectExperiment:
     # ========================================================
 
     def _make_univariate_bucket_table(
-        self,
-        df: pd.DataFrame,
-        signal_col: str,
-        y_col: str,
-        n_buckets: int = 5,
-        label_prefix: str = "bucket",
+            self,
+            df: pd.DataFrame,
+            signal_col: str,
+            y_col: str,
+            n_buckets: int = 5,
+            label_prefix: str = "bucket",
     ) -> pd.DataFrame:
         """
         Create bucket-level average response table.
@@ -1731,9 +2113,9 @@ class GEXCollaborativeEffectExperiment:
     # ========================================================
 
     def _resolve_factor_z_col(
-        self,
-        df: pd.DataFrame,
-        factor_col: str,
+            self,
+            df: pd.DataFrame,
+            factor_col: str,
     ) -> Optional[str]:
         """
         Resolve factor column to its z-scored version if available.
@@ -1754,11 +2136,11 @@ class GEXCollaborativeEffectExperiment:
         return None
 
     def _extract_interaction_summary_row(
-        self,
-        coef_table: pd.DataFrame,
-        factor: str,
-        factor_z_col: str,
-        y_col: str,
+            self,
+            coef_table: pd.DataFrame,
+            factor: str,
+            factor_z_col: str,
+            y_col: str,
     ) -> dict[str, Any]:
         """
         Flatten coefficient table into one row.
@@ -1821,9 +2203,9 @@ class GEXCollaborativeEffectExperiment:
     # ========================================================
 
     def _save_table(
-        self,
-        df: pd.DataFrame,
-        filename: str,
+            self,
+            df: pd.DataFrame,
+            filename: str,
     ) -> str:
         path = self.output_dir / filename
         df.to_csv(path, index=False)
@@ -1834,11 +2216,11 @@ class GEXCollaborativeEffectExperiment:
     # ========================================================
 
     def _plot_univariate_bucket_response(
-        self,
-        sort_df: pd.DataFrame,
-        signal_name: str,
-        y_col: str,
-        filename: str,
+            self,
+            sort_df: pd.DataFrame,
+            signal_name: str,
+            y_col: str,
+            filename: str,
     ) -> Optional[str]:
         if sort_df.empty:
             return None
@@ -1861,11 +2243,11 @@ class GEXCollaborativeEffectExperiment:
         return str(path)
 
     def _plot_top_interactions(
-        self,
-        per_y_df: pd.DataFrame,
-        y_col: str,
-        top_n: int,
-        filename: str,
+            self,
+            per_y_df: pd.DataFrame,
+            y_col: str,
+            top_n: int,
+            filename: str,
     ) -> Optional[str]:
         if per_y_df.empty:
             return None
@@ -1886,6 +2268,1319 @@ class GEXCollaborativeEffectExperiment:
         plt.close()
         return str(path)
 
+    # ========================================================
+    # Phase 3 public runner
+    # ========================================================
+
+    def run_phase3(
+            self,
+            factor_cols: Optional[list[str]] = None,
+            regime_split_y_col: str = "ret_fwd_1d",
+            double_sort_y_cols: Optional[list[str]] = None,
+    ) -> dict[str, Any]:
+        """
+        Phase 3:
+        1. regime-split factor test
+        2. double-sort analysis
+        """
+
+        if self.panel is None:
+            raise ValueError("Run Phase 1 first so self.panel is available.")
+
+        if factor_cols is None:
+            factor_cols = self.get_active_factor_cols(prefer_selected=True)
+        else:
+            factor_cols = self._resolve_requested_factor_cols(
+                available_cols=self.get_active_factor_cols(prefer_selected=False),
+                requested_factors=factor_cols,
+            )
+
+        double_sort_y_cols = double_sort_y_cols or [
+            "ret_fwd_1d",
+            "abs_ret_fwd_1d",
+            "rv_fwd_5d",
+            "tail_left_fwd_1d",
+        ]
+
+        regime_split = self.run_regime_split_factor_test(
+            factor_cols=factor_cols,
+            y_col=regime_split_y_col,
+        )
+        double_sort = self.run_double_sort_analysis(
+            factor_cols=factor_cols,
+            y_cols=double_sort_y_cols,
+        )
+
+        phase3 = {
+            "regime_split_factor_test": regime_split,
+            "double_sort": double_sort,
+        }
+        self.artifacts["phase3"] = phase3
+        return phase3
+
+    # ========================================================
+    # Module 3: Regime-split factor test
+    # ========================================================
+
+    def run_regime_split_factor_test(
+            self,
+            factor_cols: Optional[list[str]] = None,
+            y_col: str = "ret_fwd_1d",
+    ) -> dict[str, Any]:
+        """
+        Test factor efficacy separately inside negative-GEX and positive-GEX regimes.
+
+        Metrics per factor and regime:
+        - mean spread return
+        - spread vol
+        - spread sharpe
+        - spread max drawdown
+        - tail frequency
+        - IC mean
+        - rank IC mean
+        """
+
+        if self.panel is None:
+            raise ValueError("Panel is not available.")
+
+        df = self.panel.copy()
+
+        if "gex_sign_regime" not in df.columns:
+            raise ValueError("Run build_gex_regimes() in Phase 1 before Phase 3.")
+
+        if y_col not in df.columns:
+            raise ValueError(f"Target column '{y_col}' not found in panel.")
+
+        if factor_cols is None:
+            factor_cols = self.get_active_factor_cols(prefer_selected=True)
+        else:
+            factor_cols = self._resolve_requested_factor_cols(
+                available_cols=self.get_active_factor_cols(prefer_selected=False),
+                requested_factors=factor_cols,
+            )
+
+        factor_cols = [c for c in factor_cols if c in df.columns]
+        if not factor_cols:
+            warnings.warn("No factor columns resolved for regime-split factor test.")
+            empty = {
+                "factor_metrics_by_regime": pd.DataFrame(),
+                "diff_table": pd.DataFrame(),
+                "plots": {},
+            }
+            self.artifacts["regime_split_factor_test"] = empty
+            return empty
+
+        rows = []
+        diff_rows = []
+        plot_paths = {}
+
+        for factor_col in factor_cols:
+            factor_z_col = self._resolve_factor_z_col(df, factor_col)
+            signal_col = factor_z_col if factor_z_col is not None else factor_col
+
+            if signal_col not in df.columns:
+                continue
+
+            per_factor_regime = []
+
+            for regime in ["neg", "pos"]:
+                sub = df[df["gex_sign_regime"] == regime].copy()
+                if sub.empty:
+                    continue
+
+                metrics = self._compute_factor_regime_metrics(
+                    df=sub,
+                    factor_col=signal_col,
+                    y_col=y_col,
+                    n_buckets=self.regression_config.n_buckets,
+                )
+                metrics["factor"] = factor_col
+                metrics["signal_col"] = signal_col
+                metrics["regime"] = regime
+
+                rows.append(metrics)
+                per_factor_regime.append(metrics)
+
+            # diff table
+            if len(per_factor_regime) == 2:
+                neg_row = next((r for r in per_factor_regime if r["regime"] == "neg"), None)
+                pos_row = next((r for r in per_factor_regime if r["regime"] == "pos"), None)
+
+                if neg_row is not None and pos_row is not None:
+                    for metric in [
+                        "mean_spread_ret",
+                        "spread_vol",
+                        "spread_sharpe",
+                        "spread_max_dd",
+                        "tail_freq",
+                        "ic_mean",
+                        "rank_ic_mean",
+                    ]:
+                        diff_rows.append({
+                            "factor": factor_col,
+                            "signal_col": signal_col,
+                            "metric": metric,
+                            "neg_gex_value": neg_row.get(metric, np.nan),
+                            "pos_gex_value": pos_row.get(metric, np.nan),
+                            "difference": neg_row.get(metric, np.nan) - pos_row.get(metric, np.nan),
+                        })
+
+                    # plot factor spread cumulative by regime
+                    if self.regression_config.save_phase2_plots:
+                        ts_map = self._compute_factor_spread_timeseries_by_regime(
+                            df=df,
+                            factor_col=signal_col,
+                            y_col=y_col,
+                            n_buckets=self.regression_config.n_buckets,
+                        )
+                        if ts_map:
+                            plot_path = self._plot_regime_split_spread_curves(
+                                ts_map=ts_map,
+                                factor_name=factor_col,
+                                y_col=y_col,
+                                filename=f"phase3_regime_split_{factor_col}_{y_col}.png",
+                            )
+                            plot_paths[factor_col] = plot_path
+
+        factor_metrics_by_regime = pd.DataFrame(rows)
+        diff_table = pd.DataFrame(diff_rows)
+
+        if self.regression_config.save_phase2_tables:
+            if not factor_metrics_by_regime.empty:
+                self._save_table(
+                    factor_metrics_by_regime,
+                    filename=f"phase3_regime_split_metrics_{y_col}.csv",
+                )
+            if not diff_table.empty:
+                self._save_table(
+                    diff_table,
+                    filename=f"phase3_regime_split_diffs_{y_col}.csv",
+                )
+
+        out = {
+            "factor_metrics_by_regime": factor_metrics_by_regime,
+            "diff_table": diff_table,
+            "plots": plot_paths,
+        }
+        self.artifacts["regime_split_factor_test"] = out
+        return out
+
+    # ========================================================
+    # Module 4: Double-sort analysis
+    # ========================================================
+
+    def run_double_sort_analysis(
+            self,
+            factor_cols: Optional[list[str]] = None,
+            y_cols: Optional[list[str]] = None,
+    ) -> dict[str, Any]:
+        """
+        Two directions:
+        A. factor bucket first, then GEX bucket
+        B. GEX bucket first, then factor bucket
+
+        Outputs:
+        - cell mean matrices for each outcome
+        - spread-in-spread tables
+        - heatmap plots
+        """
+
+        if self.panel is None:
+            raise ValueError("Panel is not available.")
+
+        df = self.panel.copy()
+        y_cols = y_cols or ["ret_fwd_1d", "abs_ret_fwd_1d", "rv_fwd_5d", "tail_left_fwd_1d"]
+
+        if factor_cols is None:
+            factor_cols = self.get_active_factor_cols(prefer_selected=True)
+        else:
+            factor_cols = self._resolve_requested_factor_cols(
+                available_cols=self.get_active_factor_cols(prefer_selected=False),
+                requested_factors=factor_cols,
+            )
+
+        factor_cols = [c for c in factor_cols if c in df.columns]
+        if not factor_cols:
+            warnings.warn("No factor columns resolved for double-sort analysis.")
+            empty = {"results_by_factor": {}, "summary_table": pd.DataFrame(), "plots": {}}
+            self.artifacts["double_sort"] = empty
+            return empty
+
+        gex_col = self.column_config.gex_col
+        gex_z_col = f"{gex_col}{self.preprocess_config.zscore_suffix}"
+        gex_signal_col = gex_z_col if gex_z_col in df.columns else gex_col
+
+        results_by_factor = {}
+        summary_rows = []
+        plot_paths = {}
+
+        for factor_col in factor_cols:
+            factor_z_col = self._resolve_factor_z_col(df, factor_col)
+            factor_signal_col = factor_z_col if factor_z_col is not None else factor_col
+
+            if factor_signal_col not in df.columns:
+                continue
+
+            factor_res = {
+                "sort_A": {},
+                "sort_B": {},
+                "spread_tables": {},
+            }
+
+            for y_col in y_cols:
+                if y_col not in df.columns:
+                    continue
+
+                # A: factor first, GEX second
+                sort_A = self._compute_double_sort_table(
+                    df=df,
+                    first_signal_col=factor_signal_col,
+                    second_signal_col=gex_signal_col,
+                    y_col=y_col,
+                    n_buckets=self.regression_config.n_buckets,
+                    first_name="factor",
+                    second_name="gex",
+                )
+
+                # B: GEX first, factor second
+                sort_B = self._compute_double_sort_table(
+                    df=df,
+                    first_signal_col=gex_signal_col,
+                    second_signal_col=factor_signal_col,
+                    y_col=y_col,
+                    n_buckets=self.regression_config.n_buckets,
+                    first_name="gex",
+                    second_name="factor",
+                )
+
+                factor_res["sort_A"][y_col] = sort_A["cell_mean"]
+                factor_res["sort_B"][y_col] = sort_B["cell_mean"]
+
+                spread_row_A = sort_A["spread_summary"].copy()
+                spread_row_A["factor"] = factor_col
+                spread_row_A["signal_col"] = factor_signal_col
+                spread_row_A["y_col"] = y_col
+                spread_row_A["sort_direction"] = "factor_then_gex"
+
+                spread_row_B = sort_B["spread_summary"].copy()
+                spread_row_B["factor"] = factor_col
+                spread_row_B["signal_col"] = factor_signal_col
+                spread_row_B["y_col"] = y_col
+                spread_row_B["sort_direction"] = "gex_then_factor"
+
+                factor_res["spread_tables"][f"{y_col}_A"] = pd.DataFrame([spread_row_A])
+                factor_res["spread_tables"][f"{y_col}_B"] = pd.DataFrame([spread_row_B])
+
+                summary_rows.append(spread_row_A)
+                summary_rows.append(spread_row_B)
+
+                if self.regression_config.save_phase2_plots:
+                    path_A = self._plot_double_sort_heatmap(
+                        matrix=sort_A["cell_mean"],
+                        title=f"{factor_col}: factor→GEX on {y_col}",
+                        filename=f"phase3_double_sort_A_{factor_col}_{y_col}.png",
+                    )
+                    path_B = self._plot_double_sort_heatmap(
+                        matrix=sort_B["cell_mean"],
+                        title=f"{factor_col}: GEX→factor on {y_col}",
+                        filename=f"phase3_double_sort_B_{factor_col}_{y_col}.png",
+                    )
+                    plot_paths[f"{factor_col}_{y_col}_A"] = path_A
+                    plot_paths[f"{factor_col}_{y_col}_B"] = path_B
+
+            results_by_factor[factor_col] = factor_res
+
+        summary_table = pd.DataFrame(summary_rows)
+
+        if self.regression_config.save_phase2_tables:
+            if not summary_table.empty:
+                self._save_table(
+                    summary_table,
+                    filename="phase3_double_sort_summary.csv",
+                )
+
+            # save matrices too
+            for factor_name, res in results_by_factor.items():
+                for direction_key in ["sort_A", "sort_B"]:
+                    for y_col, mat in res[direction_key].items():
+                        if isinstance(mat, pd.DataFrame) and not mat.empty:
+                            self._save_table(
+                                mat.reset_index(),
+                                filename=f"phase3_{direction_key}_{factor_name}_{y_col}.csv",
+                            )
+
+        out = {
+            "results_by_factor": results_by_factor,
+            "summary_table": summary_table,
+            "plots": plot_paths,
+        }
+        self.artifacts["double_sort"] = out
+        return out
+
+    # ========================================================
+    # Regime-split helpers
+    # ========================================================
+
+    def _compute_factor_regime_metrics(
+            self,
+            df: pd.DataFrame,
+            factor_col: str,
+            y_col: str,
+            n_buckets: int = 5,
+    ) -> dict[str, Any]:
+        """
+        Compute factor efficacy metrics in one regime.
+        """
+
+        spread_ts = self._compute_factor_spread_timeseries(
+            df=df,
+            factor_col=factor_col,
+            y_col=y_col,
+            n_buckets=n_buckets,
+        )
+
+        ic_df = self._compute_daily_ic(
+            df=df,
+            factor_col=factor_col,
+            y_col=y_col,
+        )
+
+        if spread_ts.empty:
+            return {
+                "mean_spread_ret": np.nan,
+                "spread_vol": np.nan,
+                "spread_sharpe": np.nan,
+                "spread_max_dd": np.nan,
+                "tail_freq": np.nan,
+                "ic_mean": ic_df["ic"].mean() if not ic_df.empty else np.nan,
+                "rank_ic_mean": ic_df["rank_ic"].mean() if not ic_df.empty else np.nan,
+                "n_dates": ic_df["date"].nunique() if not ic_df.empty else 0,
+            }
+
+        perf = self._compute_performance_stats(spread_ts["spread_ret"])
+
+        return {
+            "mean_spread_ret": perf["mean_ret"],
+            "spread_vol": perf["vol"],
+            "spread_sharpe": perf["sharpe"],
+            "spread_max_dd": perf["max_drawdown"],
+            "tail_freq": float((spread_ts["spread_ret"] < 0).mean()),
+            "ic_mean": ic_df["ic"].mean() if not ic_df.empty else np.nan,
+            "rank_ic_mean": ic_df["rank_ic"].mean() if not ic_df.empty else np.nan,
+            "n_dates": int(spread_ts["date"].nunique()),
+        }
+
+    def _compute_factor_spread_timeseries(
+            self,
+            df: pd.DataFrame,
+            factor_col: str,
+            y_col: str,
+            n_buckets: int = 5,
+    ) -> pd.DataFrame:
+        """
+        Daily long-short spread time series based on factor buckets.
+        """
+
+        work = df[[self.column_config.date_col, factor_col, y_col]].dropna().copy()
+        if work.empty:
+            return pd.DataFrame(columns=["date", "top", "bottom", "spread_ret"])
+
+        bucket_col = "__factor_bucket"
+        work[bucket_col] = self.assign_quantile_bucket_by_date(
+            work,
+            col=factor_col,
+            n_buckets=n_buckets,
+        )
+        work = work.dropna(subset=[bucket_col]).copy()
+
+        daily_bucket = (
+            work.groupby([self.column_config.date_col, bucket_col])[y_col]
+            .mean()
+            .reset_index()
+        )
+
+        pivot = daily_bucket.pivot(
+            index=self.column_config.date_col,
+            columns=bucket_col,
+            values=y_col,
+        ).reset_index()
+
+        if 1.0 not in pivot.columns or float(n_buckets) not in pivot.columns:
+            if 1 not in pivot.columns or n_buckets not in pivot.columns:
+                return pd.DataFrame(columns=["date", "top", "bottom", "spread_ret"])
+
+        top_col = float(n_buckets) if float(n_buckets) in pivot.columns else n_buckets
+        bot_col = 1.0 if 1.0 in pivot.columns else 1
+
+        out = pd.DataFrame({
+            "date": pivot[self.column_config.date_col],
+            "top": pivot[top_col],
+            "bottom": pivot[bot_col],
+        })
+        out["spread_ret"] = out["top"] - out["bottom"]
+        return out.dropna(subset=["spread_ret"]).reset_index(drop=True)
+
+    def _compute_factor_spread_timeseries_by_regime(
+            self,
+            df: pd.DataFrame,
+            factor_col: str,
+            y_col: str,
+            n_buckets: int = 5,
+    ) -> dict[str, pd.DataFrame]:
+        out = {}
+        for regime in ["neg", "pos"]:
+            sub = df[df["gex_sign_regime"] == regime].copy()
+            ts = self._compute_factor_spread_timeseries(
+                df=sub,
+                factor_col=factor_col,
+                y_col=y_col,
+                n_buckets=n_buckets,
+            )
+            if not ts.empty:
+                out[regime] = ts
+        return out
+
+    def _compute_daily_ic(
+            self,
+            df: pd.DataFrame,
+            factor_col: str,
+            y_col: str,
+    ) -> pd.DataFrame:
+        """
+        Daily Pearson IC and Spearman rank IC.
+        """
+
+        rows = []
+        for dt, sub in df.groupby(self.column_config.date_col):
+            sub = sub[[factor_col, y_col]].dropna().copy()
+            if len(sub) < 5:
+                continue
+
+            if sub[factor_col].nunique() < 2 or sub[y_col].nunique() < 2:
+                continue
+
+            ic = sub[factor_col].corr(sub[y_col], method="pearson")
+            rank_ic = sub[factor_col].corr(sub[y_col], method="spearman")
+
+            rows.append({
+                "date": dt,
+                "ic": ic,
+                "rank_ic": rank_ic,
+            })
+
+        return pd.DataFrame(rows)
+
+    def _compute_performance_stats(
+            self,
+            ret_series: pd.Series,
+    ) -> dict[str, float]:
+        """
+        Generic stats for daily series.
+        """
+
+        s = pd.Series(ret_series).dropna().astype(float)
+        if s.empty:
+            return {
+                "mean_ret": np.nan,
+                "vol": np.nan,
+                "sharpe": np.nan,
+                "downside_dev": np.nan,
+                "max_drawdown": np.nan,
+            }
+
+        mean_ret = float(s.mean())
+        vol = float(s.std(ddof=1))
+        sharpe = mean_ret / vol if vol > 0 else np.nan
+
+        downside = s[s < 0]
+        downside_dev = float(np.sqrt((downside ** 2).mean())) if len(downside) else 0.0
+
+        curve = (1.0 + s).cumprod()
+        running_max = curve.cummax()
+        drawdown = curve / running_max - 1.0
+        max_dd = float(drawdown.min()) if not drawdown.empty else np.nan
+
+        return {
+            "mean_ret": mean_ret,
+            "vol": vol,
+            "sharpe": sharpe,
+            "downside_dev": downside_dev,
+            "max_drawdown": max_dd,
+        }
+
+    # ========================================================
+    # Double-sort helpers
+    # ========================================================
+
+    def _compute_double_sort_table(
+            self,
+            df: pd.DataFrame,
+            first_signal_col: str,
+            second_signal_col: str,
+            y_col: str,
+            n_buckets: int = 5,
+            first_name: str = "first",
+            second_name: str = "second",
+    ) -> dict[str, Any]:
+        """
+        Sequential double sort by date:
+        1. bucket on first signal within date
+        2. within each date-firstbucket group, bucket on second signal
+        3. compute cell average of y
+        """
+
+        work = df[[self.column_config.date_col, first_signal_col, second_signal_col, y_col]].dropna().copy()
+
+        work[first_signal_col] = pd.to_numeric(work[first_signal_col], errors="coerce")
+        work[second_signal_col] = pd.to_numeric(work[second_signal_col], errors="coerce")
+        work[y_col] = pd.to_numeric(work[y_col], errors="coerce")
+        work = work.dropna(subset=[first_signal_col, second_signal_col, y_col]).copy()
+
+        median_date_count = work.groupby(self.column_config.date_col).size().median()
+        if pd.notna(median_date_count) and median_date_count < n_buckets ** 2:
+            warnings.warn(
+                f"Double-sort: median cross-section size is {median_date_count:.0f} "
+                f"but n_buckets²={n_buckets ** 2} — cells will be very thin or empty. "
+                f"Consider reducing n_buckets (e.g. to {max(2, int(median_date_count ** 0.5))})."
+            )
+
+        if work.empty:
+            return {
+                "cell_mean": pd.DataFrame(),
+                "spread_summary": {
+                    "mean_top_minus_bottom_second_in_high_first": np.nan,
+                    "mean_top_minus_bottom_second_in_low_first": np.nan,
+                    "spread_in_spread": np.nan,
+                },
+            }
+
+        first_bucket_col = f"__{first_name}_bucket"
+        second_bucket_col = f"__{second_name}_bucket"
+
+        work[first_bucket_col] = self.assign_quantile_bucket_by_date(
+            work,
+            col=first_signal_col,
+            n_buckets=n_buckets,
+        )
+        work = work.dropna(subset=[first_bucket_col]).copy()
+
+        def _assign_second(group: pd.DataFrame) -> pd.DataFrame:
+            group = group.copy()
+            if len(group) < 2:
+                group[second_bucket_col] = np.nan
+                return group
+            effective_q = min(n_buckets, len(group))
+            try:
+                group[second_bucket_col] = pd.qcut(
+                    group[second_signal_col],
+                    q=effective_q,
+                    labels=False,
+                    duplicates="drop",
+                ) + 1
+            except Exception:
+                group[second_bucket_col] = np.nan
+            return group
+
+        work = (
+            work.groupby([self.column_config.date_col, first_bucket_col], group_keys=False)
+            .apply(_assign_second)
+        )
+        work = work.dropna(subset=[second_bucket_col]).copy()
+
+        cell_ts = (
+            work.groupby([self.column_config.date_col, first_bucket_col, second_bucket_col])[y_col]
+            .mean()
+            .reset_index()
+        )
+
+        cell_mean = (
+            cell_ts.groupby([first_bucket_col, second_bucket_col])[y_col]
+            .mean()
+            .unstack(second_bucket_col)
+            .sort_index()
+        )
+
+        cell_mean = cell_mean.apply(pd.to_numeric, errors="coerce")
+
+        # spread-in-spread summary — use actual bucket range from data
+        actual_first_buckets = sorted(cell_ts[first_bucket_col].dropna().unique())
+
+        if len(actual_first_buckets) < 2:
+            spread_summary = {
+                "mean_top_minus_bottom_second_in_high_first": np.nan,
+                "mean_top_minus_bottom_second_in_low_first": np.nan,
+                "spread_in_spread": np.nan,
+            }
+            return {"cell_mean": cell_mean, "spread_summary": spread_summary}
+
+        high_first = actual_first_buckets[-1]
+        low_first = actual_first_buckets[0]
+
+        high_rows = cell_ts[cell_ts[first_bucket_col] == high_first]
+        low_rows = cell_ts[cell_ts[first_bucket_col] == low_first]
+
+        def _compute_second_spread(sub: pd.DataFrame) -> pd.Series:
+            piv = sub.pivot(
+                index=self.column_config.date_col,
+                columns=second_bucket_col,
+                values=y_col,
+            )
+            sorted_cols = sorted(piv.columns)
+            if len(sorted_cols) < 2:
+                return pd.Series(dtype=float)
+            return piv[sorted_cols[-1]] - piv[sorted_cols[0]]
+
+        high_spread = _compute_second_spread(high_rows)
+        low_spread = _compute_second_spread(low_rows)
+
+        high_mean = float(high_spread.mean()) if len(high_spread) else np.nan
+        low_mean = float(low_spread.mean()) if len(low_spread) else np.nan
+        sis = high_mean - low_mean if pd.notna(high_mean) and pd.notna(low_mean) else np.nan
+
+        spread_summary = {
+            "mean_top_minus_bottom_second_in_high_first": high_mean,
+            "mean_top_minus_bottom_second_in_low_first": low_mean,
+            "spread_in_spread": sis,
+        }
+
+        return {
+            "cell_mean": cell_mean,
+            "spread_summary": spread_summary,
+        }
+
+    # ========================================================
+    # Phase 3 plot helpers
+    # ========================================================
+
+    def _plot_regime_split_spread_curves(
+            self,
+            ts_map: dict[str, pd.DataFrame],
+            factor_name: str,
+            y_col: str,
+            filename: str,
+    ) -> Optional[str]:
+        if not ts_map:
+            return None
+
+        plt.figure(figsize=(9, 5))
+
+        for regime, ts in ts_map.items():
+            if ts.empty:
+                continue
+            curve = (1.0 + ts["spread_ret"].fillna(0.0)).cumprod()
+            plt.plot(ts["date"], curve, label=regime)
+
+        plt.title(f"Factor spread curves by GEX regime: {factor_name} on {y_col}")
+        plt.xlabel("Date")
+        plt.ylabel("Cumulative growth")
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+
+        path = self.output_dir / filename
+        plt.savefig(path, dpi=150)
+        plt.close()
+        return str(path)
+
+    def _plot_double_sort_heatmap(
+            self,
+            matrix: pd.DataFrame,
+            title: str,
+            filename: str,
+    ) -> Optional[str]:
+        if matrix is None or matrix.empty:
+            return None
+
+        plot_df = matrix.copy()
+
+        # force numeric values
+        plot_df = plot_df.apply(pd.to_numeric, errors="coerce")
+
+        # drop fully empty rows/cols after coercion
+        plot_df = plot_df.dropna(axis=0, how="all").dropna(axis=1, how="all")
+
+        if plot_df.empty:
+            return None
+
+        values = plot_df.to_numpy(dtype=float)
+
+        plt.figure(figsize=(7, 5))
+        plt.imshow(values, aspect="auto")
+        plt.colorbar()
+        plt.title(title)
+        plt.xlabel(plot_df.columns.name if plot_df.columns.name is not None else "Second bucket")
+        plt.ylabel(plot_df.index.name if plot_df.index.name is not None else "First bucket")
+        plt.xticks(range(len(plot_df.columns)), [str(c) for c in plot_df.columns])
+        plt.yticks(range(len(plot_df.index)), [str(i) for i in plot_df.index])
+        plt.tight_layout()
+
+        path = self.output_dir / filename
+        plt.savefig(path, dpi=150)
+        plt.close()
+        return str(path)
+
+    # ========================================================
+    # Phase 4 public runner
+    # ========================================================
+
+    def run_phase4(
+            self,
+            factor_cols: Optional[list[str]] = None,
+            target_cols: Optional[list[str]] = None,
+    ) -> dict[str, Any]:
+        """
+        Phase 4:
+        tail classification / regime classification.
+        """
+
+        if self.panel is None:
+            raise ValueError("Run Phase 1 first so self.panel is available.")
+
+        if factor_cols is None:
+            factor_cols = self.get_active_factor_cols(prefer_selected=True)
+        else:
+            factor_cols = self._resolve_requested_factor_cols(
+                available_cols=self.get_active_factor_cols(prefer_selected=False),
+                requested_factors=factor_cols,
+            )
+
+        target_cols = target_cols or self.classification_config.target_cols
+
+        out = self.run_tail_classification(
+            factor_cols=factor_cols,
+            target_cols=target_cols,
+        )
+        self.artifacts["phase4"] = out
+        return out
+
+    # ========================================================
+    # Module 5: Tail classification
+    # ========================================================
+
+    def run_tail_classification(
+            self,
+            factor_cols: Optional[list[str]] = None,
+            target_cols: Optional[list[str]] = None,
+    ) -> dict[str, Any]:
+        """
+        Compare simple classification setups for tail-event prediction.
+
+        Feature sets per factor:
+        1. factor_only
+        2. gex_only
+        3. factor_plus_gex
+        4. factor_plus_gex_plus_interaction
+
+        Models in initial version:
+        - logistic regression (L2)
+        - elastic-net logistic regression
+
+        Leaves room for advanced models later.
+        """
+
+        if self.panel is None:
+            raise ValueError("Panel is not available.")
+
+        df = self.panel.copy()
+        target_cols = target_cols or self.classification_config.target_cols
+
+        gex_col = self.column_config.gex_col
+        gex_z_col = f"{gex_col}{self.preprocess_config.zscore_suffix}"
+        if gex_z_col not in df.columns:
+            raise ValueError(
+                f"Expected z-scored GEX column '{gex_z_col}' not found. "
+                "Make sure Phase 1 preprocessing created it."
+            )
+
+        if factor_cols is None:
+            factor_cols = self.get_active_factor_cols(prefer_selected=True)
+        else:
+            factor_cols = self._resolve_requested_factor_cols(
+                available_cols=self.get_active_factor_cols(prefer_selected=False),
+                requested_factors=factor_cols,
+            )
+
+        factor_cols = [c for c in factor_cols if c in df.columns]
+        if not factor_cols:
+            warnings.warn("No factor columns resolved for tail classification.")
+            empty = {
+                "model_scores": pd.DataFrame(),
+                "predictions": {},
+                "plots": {},
+            }
+            self.artifacts["tail_classification"] = empty
+            return empty
+
+        controls = self._get_available_classification_control_cols(df)
+        scores_rows = []
+        predictions = {}
+        plot_paths = {}
+
+        for target_col in target_cols:
+            if target_col not in df.columns:
+                continue
+
+            if not self._is_binary_target(df[target_col]):
+                warnings.warn(
+                    f"Skipping target '{target_col}' because it is not binary after cleaning."
+                )
+                continue
+
+            predictions[target_col] = {}
+
+            for factor_col in factor_cols:
+                factor_z_col = self._resolve_factor_z_col(df, factor_col)
+                signal_col = factor_z_col if factor_z_col is not None else factor_col
+
+                if signal_col not in df.columns:
+                    continue
+
+                feature_sets = self._build_tail_feature_sets(
+                    df=df,
+                    factor_col=signal_col,
+                    gex_col=gex_z_col,
+                    controls=controls,
+                )
+
+                for feature_set_name, x_cols in feature_sets.items():
+                    if not x_cols:
+                        continue
+
+                    split = self._make_classification_split(
+                        df=df,
+                        feature_cols=x_cols,
+                        target_col=target_col,
+                    )
+                    if split is None:
+                        continue
+
+                    X_train, y_train, X_test, y_test, split_meta = split
+
+                    # keep raw predictions for best model selection later
+                    local_pred_store = []
+
+                    for model_name in self.classification_config.model_names:
+                        model = self._build_classifier(model_name=model_name)
+                        if model is None:
+                            continue
+
+                        try:
+                            model.fit(X_train, y_train)
+                            prob = model.predict_proba(X_test)[:, 1]
+                            pred = (prob >= 0.5).astype(int)
+                        except Exception as e:
+                            warnings.warn(
+                                f"Classification failed for target={target_col}, "
+                                f"factor={factor_col}, feature_set={feature_set_name}, "
+                                f"model={model_name}: {e}"
+                            )
+                            continue
+
+                        metric_row = self._compute_classification_metrics(
+                            y_true=y_test,
+                            y_prob=prob,
+                            y_pred=pred,
+                        )
+                        metric_row.update({
+                            "target_col": target_col,
+                            "factor": factor_col,
+                            "signal_col": signal_col,
+                            "feature_set": feature_set_name,
+                            "model_name": model_name,
+                            "n_train": len(y_train),
+                            "n_test": len(y_test),
+                            "train_pos_rate": float(np.mean(y_train)),
+                            "test_pos_rate": float(np.mean(y_test)),
+                            **split_meta,
+                        })
+                        scores_rows.append(metric_row)
+
+                        pred_df = pd.DataFrame({
+                            "y_true": y_test,
+                            "y_prob": prob,
+                            "y_pred": pred,
+                        })
+                        predictions[target_col][f"{factor_col}__{feature_set_name}__{model_name}"] = pred_df
+                        local_pred_store.append((metric_row, pred_df))
+
+            # plot best ROC and best score bars per target
+            target_scores = pd.DataFrame([r for r in scores_rows if r["target_col"] == target_col])
+            if not target_scores.empty:
+                if self.classification_config.save_phase4_tables:
+                    self._save_table(
+                        target_scores,
+                        filename=f"phase4_tail_scores_{target_col}.csv",
+                    )
+
+                if self.classification_config.save_phase4_plots:
+                    # best overall ROC by AUC
+                    best_row = target_scores.sort_values("auc", ascending=False).iloc[0].to_dict()
+                    pred_key = f'{best_row["factor"]}__{best_row["feature_set"]}__{best_row["model_name"]}'
+                    pred_df = predictions[target_col].get(pred_key)
+
+                    if pred_df is not None and not pred_df.empty:
+                        roc_path = self._plot_roc_curve(
+                            y_true=pred_df["y_true"].to_numpy(),
+                            y_prob=pred_df["y_prob"].to_numpy(),
+                            title=(
+                                f'Best ROC for {target_col}\n'
+                                f'{best_row["factor"]} | {best_row["feature_set"]} | {best_row["model_name"]}'
+                            ),
+                            filename=f"phase4_roc_{target_col}.png",
+                        )
+                        plot_paths[f"{target_col}_roc"] = roc_path
+
+                    bar_path = self._plot_classification_score_bars(
+                        target_scores=target_scores,
+                        target_col=target_col,
+                        metric="auc",
+                        top_n=self.classification_config.top_n_factor_plots,
+                        filename=f"phase4_auc_bar_{target_col}.png",
+                    )
+                    plot_paths[f"{target_col}_auc_bar"] = bar_path
+
+        model_scores = pd.DataFrame(scores_rows)
+
+        if self.classification_config.save_phase4_tables and not model_scores.empty:
+            self._save_table(
+                model_scores,
+                filename="phase4_tail_scores_all.csv",
+            )
+
+        out = {
+            "model_scores": model_scores,
+            "predictions": predictions,
+            "plots": plot_paths,
+        }
+        self.artifacts["tail_classification"] = out
+        return out
+
+    # ========================================================
+    # Classification helpers
+    # ========================================================
+
+    def _get_available_classification_control_cols(self, df: pd.DataFrame) -> list[str]:
+        candidates = []
+        if self.classification_config.use_controls:
+            candidates.extend(self.column_config.control_cols or [])
+            candidates.extend(self.regression_config.control_cols or [])
+            candidates.extend(self.classification_config.control_cols or [])
+
+        out = []
+        seen = set()
+        for c in candidates:
+            if c in seen:
+                continue
+            seen.add(c)
+            if c in df.columns and pd.api.types.is_numeric_dtype(df[c]):
+                out.append(c)
+        return out
+
+    def _is_binary_target(self, s: pd.Series) -> bool:
+        clean = pd.to_numeric(s, errors="coerce").dropna()
+        if clean.empty:
+            return False
+        uniq = set(clean.unique().tolist())
+        return uniq.issubset({0, 1})
+
+    def _build_tail_feature_sets(
+            self,
+            df: pd.DataFrame,
+            factor_col: str,
+            gex_col: str,
+            controls: list[str],
+    ) -> dict[str, list[str]]:
+        feature_sets = {
+            "factor_only": [factor_col] + controls,
+            "gex_only": [gex_col] + controls,
+            "factor_plus_gex": [factor_col, gex_col] + controls,
+        }
+
+        if self.classification_config.include_factor_interaction:
+            interaction_col = f"__interaction__{factor_col}__x__{gex_col}"
+            if interaction_col not in df.columns:
+                df[interaction_col] = pd.to_numeric(df[factor_col], errors="coerce") * pd.to_numeric(df[gex_col],
+                                                                                                     errors="coerce")
+            feature_sets["factor_plus_gex_plus_interaction"] = [factor_col, gex_col, interaction_col] + controls
+
+        # deduplicate while preserving order
+        clean_feature_sets = {}
+        for k, cols in feature_sets.items():
+            clean_feature_sets[k] = list(dict.fromkeys([c for c in cols if c in df.columns]))
+        return clean_feature_sets
+
+    def _make_classification_split(
+            self,
+            df: pd.DataFrame,
+            feature_cols: list[str],
+            target_col: str,
+    ) -> Optional[tuple[pd.DataFrame, np.ndarray, pd.DataFrame, np.ndarray, dict[str, Any]]]:
+        """
+        Date-based train/test split to avoid random leakage across dates.
+        """
+
+        date_col = self.column_config.date_col
+        work = df[[date_col, target_col] + feature_cols].copy()
+
+        # numeric coercion for features / target
+        for c in feature_cols:
+            work[c] = pd.to_numeric(work[c], errors="coerce")
+        work[target_col] = pd.to_numeric(work[target_col], errors="coerce")
+
+        work = work.dropna(subset=[target_col]).copy()
+        if work.empty:
+            return None
+
+        dates = np.array(sorted(work[date_col].dropna().unique()))
+        if len(dates) < 10:
+            return None
+
+        train_mask, test_mask, split_meta = self._build_date_split_masks(work[date_col])
+
+        train_df = work.loc[train_mask].copy()
+        test_df = work.loc[test_mask].copy()
+
+        # drop rows missing all features
+        train_df = train_df.dropna(subset=feature_cols, how="all")
+        test_df = test_df.dropna(subset=feature_cols, how="all")
+
+        if len(train_df) < self.classification_config.min_train_rows:
+            return None
+        if len(test_df) < self.classification_config.min_test_rows:
+            return None
+
+        # both classes must exist
+        y_train = train_df[target_col].astype(int).to_numpy()
+        y_test = test_df[target_col].astype(int).to_numpy()
+
+        if len(np.unique(y_train)) < 2 or len(np.unique(y_test)) < 2:
+            return None
+
+        X_train = train_df[feature_cols].copy()
+        X_test = test_df[feature_cols].copy()
+
+        return X_train, y_train, X_test, y_test, split_meta
+
+    def _build_date_split_masks(
+            self,
+            date_series: pd.Series,
+    ) -> tuple[pd.Series, pd.Series, dict[str, Any]]:
+        """
+        Explicit date-range split if provided, otherwise chronological split by unique dates.
+        """
+
+        s = pd.to_datetime(date_series)
+        cfg = self.classification_config
+
+        if cfg.train_end is not None and cfg.test_start is not None:
+            train_start = pd.Timestamp(cfg.train_start) if cfg.train_start else s.min()
+            train_end = pd.Timestamp(cfg.train_end)
+            test_start = pd.Timestamp(cfg.test_start)
+            test_end = pd.Timestamp(cfg.test_end) if cfg.test_end else s.max()
+
+            train_mask = (s >= train_start) & (s <= train_end)
+            test_mask = (s >= test_start) & (s <= test_end)
+
+            split_meta = {
+                "split_type": "explicit_date_range",
+                "train_start": str(train_start.date()),
+                "train_end": str(train_end.date()),
+                "test_start": str(test_start.date()),
+                "test_end": str(test_end.date()),
+            }
+            return train_mask, test_mask, split_meta
+
+        # fallback chronological split
+        unique_dates = np.array(sorted(s.dropna().unique()))
+        split_idx = max(1, int(len(unique_dates) * (1 - cfg.test_size)))
+        split_idx = min(split_idx, len(unique_dates) - 1)
+
+        train_dates = set(unique_dates[:split_idx])
+        test_dates = set(unique_dates[split_idx:])
+
+        train_mask = s.isin(train_dates)
+        test_mask = s.isin(test_dates)
+
+        split_meta = {
+            "split_type": "chronological_fraction",
+            "train_start": str(pd.Timestamp(min(train_dates)).date()),
+            "train_end": str(pd.Timestamp(max(train_dates)).date()),
+            "test_start": str(pd.Timestamp(min(test_dates)).date()),
+            "test_end": str(pd.Timestamp(max(test_dates)).date()),
+        }
+        return train_mask, test_mask, split_meta
+
+    def _build_classifier(
+            self,
+            model_name: str,
+    ):
+        """
+        Simple first-version models only.
+        Updated for sklearn penalty deprecation and better convergence.
+        """
+
+        from sklearn.preprocessing import StandardScaler
+
+        cfg = self.classification_config
+
+        if model_name == "logit_l2":
+            clf = LogisticRegression(
+                # penalty deprecated in sklearn >= 1.8
+                l1_ratio=0.0,
+                C=cfg.C,
+                solver="lbfgs",
+                max_iter=max(cfg.max_iter, 3000),
+                class_weight=cfg.class_weight,
+            )
+
+        elif model_name == "logit_elasticnet":
+            clf = LogisticRegression(
+                # elastic net via l1_ratio
+                l1_ratio=cfg.l1_ratio,
+                C=cfg.C,
+                solver="saga",
+                max_iter=max(cfg.max_iter, 5000),
+                class_weight=cfg.class_weight,
+                tol=1e-3,  # slightly looser tolerance helps convergence
+            )
+
+        else:
+            warnings.warn(f"Unsupported model_name '{model_name}' in current Phase 4.")
+            return None
+
+        pipe = Pipeline([
+            ("imputer", SimpleImputer(strategy=self.classification_config.imputer_strategy)),
+            ("scaler", StandardScaler()),
+            ("model", clf),
+        ])
+        return pipe
+
+    def _compute_classification_metrics(
+            self,
+            y_true: np.ndarray,
+            y_prob: np.ndarray,
+            y_pred: np.ndarray,
+    ) -> dict[str, float]:
+        out = {
+            "auc": np.nan,
+            "accuracy": np.nan,
+            "precision": np.nan,
+            "recall": np.nan,
+            "f1": np.nan,
+            "brier": np.nan,
+        }
+
+        try:
+            out["auc"] = float(roc_auc_score(y_true, y_prob))
+        except Exception:
+            pass
+
+        try:
+            out["accuracy"] = float(accuracy_score(y_true, y_pred))
+        except Exception:
+            pass
+
+        try:
+            out["precision"] = float(precision_score(y_true, y_pred, zero_division=0))
+        except Exception:
+            pass
+
+        try:
+            out["recall"] = float(recall_score(y_true, y_pred, zero_division=0))
+        except Exception:
+            pass
+
+        try:
+            out["f1"] = float(f1_score(y_true, y_pred, zero_division=0))
+        except Exception:
+            pass
+
+        try:
+            out["brier"] = float(brier_score_loss(y_true, y_prob))
+        except Exception:
+            pass
+
+        return out
+
+    # ========================================================
+    # Phase 4 plot helpers
+    # ========================================================
+
+    def _plot_roc_curve(
+            self,
+            y_true: np.ndarray,
+            y_prob: np.ndarray,
+            title: str,
+            filename: str,
+    ) -> Optional[str]:
+        if len(y_true) == 0:
+            return None
+
+        try:
+            fpr, tpr, _ = roc_curve(y_true, y_prob)
+            auc = roc_auc_score(y_true, y_prob)
+        except Exception:
+            return None
+
+        plt.figure(figsize=(7, 5))
+        plt.plot(fpr, tpr, label=f"AUC = {auc:.3f}")
+        plt.plot([0, 1], [0, 1], linestyle="--")
+        plt.xlabel("False Positive Rate")
+        plt.ylabel("True Positive Rate")
+        plt.title(title)
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+
+        path = self.output_dir / filename
+        plt.savefig(path, dpi=150)
+        plt.close()
+        return str(path)
+
+    def _plot_classification_score_bars(
+            self,
+            target_scores: pd.DataFrame,
+            target_col: str,
+            metric: str = "auc",
+            top_n: int = 15,
+            filename: str = "phase4_bar.png",
+    ) -> Optional[str]:
+        if target_scores.empty or metric not in target_scores.columns:
+            return None
+
+        plot_df = (
+            target_scores
+            .sort_values(metric, ascending=False)
+            .head(top_n)
+            .copy()
+        )
+
+        if plot_df.empty:
+            return None
+
+        plot_df["label"] = (
+                plot_df["factor"].astype(str)
+                + " | "
+                + plot_df["feature_set"].astype(str)
+                + " | "
+                + plot_df["model_name"].astype(str)
+        )
+
+        plot_df = plot_df.sort_values(metric, ascending=True)
+
+        plt.figure(figsize=(10, max(5, 0.35 * len(plot_df))))
+        plt.barh(plot_df["label"], plot_df[metric])
+        plt.xlabel(metric.upper())
+        plt.ylabel("Specification")
+        plt.title(f"Top {top_n} {metric.upper()} results for {target_col}")
+        plt.grid(True, axis="x", alpha=0.3)
+        plt.tight_layout()
+
+        path = self.output_dir / filename
+        plt.savefig(path, dpi=150)
+        plt.close()
+        return str(path)
+
     # --------------------------------------------------------
     # Metadata / outputs
     # --------------------------------------------------------
@@ -1897,9 +3592,12 @@ class GEXCollaborativeEffectExperiment:
 
         meta = {
             "n_rows": int(len(panel)),
-            "n_permnos": int(panel[self.column_config.id_col].nunique()) if self.column_config.id_col in panel.columns else None,
-            "start_date": str(panel[self.column_config.date_col].min().date()) if self.column_config.date_col in panel.columns else None,
-            "end_date": str(panel[self.column_config.date_col].max().date()) if self.column_config.date_col in panel.columns else None,
+            "n_permnos": int(
+                panel[self.column_config.id_col].nunique()) if self.column_config.id_col in panel.columns else None,
+            "start_date": str(panel[
+                                  self.column_config.date_col].min().date()) if self.column_config.date_col in panel.columns else None,
+            "end_date": str(panel[
+                                self.column_config.date_col].max().date()) if self.column_config.date_col in panel.columns else None,
             "factor_cols_all": self.factor_cols_all,
             "factor_cols_daily": self.factor_cols_daily,
             "factor_cols_monthly": self.factor_cols_monthly,
@@ -1908,7 +3606,9 @@ class GEXCollaborativeEffectExperiment:
             "preprocess_config": self._json_safe_dataclass(self.preprocess_config),
             "target_config": self._json_safe_dataclass(self.target_config),
             "regression_config": self._json_safe_dataclass(self.regression_config),
+            "classification_config": self._json_safe_dataclass(self.classification_config),
             "output_config": self._json_safe_dataclass(self.output_config),
+            "identifier_config": self._json_safe_dataclass(self.identifier_config),
         }
         self.metadata = meta
 
