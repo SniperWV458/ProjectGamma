@@ -4555,6 +4555,7 @@ class GEXCollaborativeEffectExperiment:
                 continue
 
             base_daily = base_daily.sort_values(date_col).reset_index(drop=True)
+            base_daily["portfolio_ret_base"] = base_daily["portfolio_ret"]
             base_daily["factor"] = raw_factor
             base_daily["signal_col"] = factor_signal_col
             base_daily["strategy_name"] = "base"
@@ -4583,6 +4584,7 @@ class GEXCollaborativeEffectExperiment:
 
                 df1 = self._estimate_turnover_and_cost(df1, scale_col="scale_used")
                 df1["portfolio_ret_net"] = df1["portfolio_ret_scaled"] - df1["_overlay_cost"]
+                df1["portfolio_ret"] = df1["portfolio_ret_net"]
 
                 df1["factor"] = raw_factor
                 df1["signal_col"] = factor_signal_col
@@ -4613,6 +4615,7 @@ class GEXCollaborativeEffectExperiment:
 
                 df2 = self._estimate_turnover_and_cost(df2, scale_col="scale_used")
                 df2["portfolio_ret_net"] = df2["portfolio_ret_scaled"] - df2["_overlay_cost"]
+                df2["portfolio_ret"] = df2["portfolio_ret_net"]
 
                 df2["factor"] = raw_factor
                 df2["signal_col"] = factor_signal_col
@@ -4645,6 +4648,7 @@ class GEXCollaborativeEffectExperiment:
 
                     df3 = self._estimate_turnover_and_cost(df3, scale_col="scale_used")
                     df3["portfolio_ret_net"] = df3["portfolio_ret_scaled"] - df3["_overlay_cost"]
+                    df3["portfolio_ret"] = df3["portfolio_ret_net"]
 
                     df3["factor"] = raw_factor
                     df3["signal_col"] = factor_signal_col
