@@ -4,14 +4,17 @@ import json
 import warnings
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
-from typing import Optional, Literal, Any
+from typing import Any, Optional, Literal
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import statsmodels.api as sm
 from scipy import stats
+from sklearn.ensemble import HistGradientBoostingClassifier
+from sklearn.ensemble import RandomForestClassifier
 from sklearn.impute import SimpleImputer
+from sklearn.inspection import permutation_importance
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
     roc_auc_score,
@@ -23,7 +26,9 @@ from sklearn.metrics import (
     roc_curve,
 )
 from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
 from statsmodels.stats.sandwich_covariance import cov_hac
+from tqdm.auto import tqdm
 
 
 # ============================================================
@@ -32,15 +37,6 @@ from statsmodels.stats.sandwich_covariance import cov_hac
 
 @dataclass
 class FactorSpec:
-    """
-    Specification for one factor source.
-
-    Supports:
-    - factors already in the base panel
-    - external csv/parquet files
-    - daily or monthly factor frequency
-    """
-
     name: str
     path: Optional[str | Path] = None
     file_type: Optional[Literal["csv", "parquet"]] = None
@@ -64,12 +60,6 @@ class FactorSpec:
 
 @dataclass
 class IdentifierConfig:
-    """
-    Identifier mapping configuration.
-
-    Used when factor sources are not keyed by permno directly.
-    Example: ticker-based factor files that need to be mapped to permno.
-    """
     mapping_path: Optional[str | Path] = None
     mapping_file_type: Optional[Literal["csv", "parquet"]] = None
 
@@ -95,10 +85,6 @@ class IdentifierConfig:
 
 @dataclass
 class DataConfig:
-    """
-    Core data paths.
-    """
-
     # Anchor files
     underlying_gex_path: str | Path
     crsp_daily_path: str | Path
@@ -122,10 +108,6 @@ class DataConfig:
 
 @dataclass
 class ColumnConfig:
-    """
-    Naming contract for the merged base panel.
-    """
-
     id_col: str = "permno"
     date_col: str = "date"
 
@@ -148,10 +130,6 @@ class ColumnConfig:
 
 @dataclass
 class PreprocessConfig:
-    """
-    Preprocessing behavior for factor and signal columns.
-    """
-
     winsorize: bool = True
     winsor_lower: float = 0.01
     winsor_upper: float = 0.99
@@ -173,10 +151,6 @@ class PreprocessConfig:
 
 @dataclass
 class TargetConfig:
-    """
-    Forward target construction.
-    """
-
     horizons: list[int] = field(default_factory=lambda: [1, 5, 20])
 
     create_signed_return: bool = True
@@ -196,10 +170,6 @@ class TargetConfig:
 
 @dataclass
 class OutputConfig:
-    """
-    Output control.
-    """
-
     output_dir: str | Path
     save_panel_snapshot: bool = True
     save_metadata: bool = True
@@ -210,10 +180,6 @@ class OutputConfig:
 
 @dataclass
 class RegressionConfig:
-    """
-    Regression and Phase 2 analysis settings.
-    """
-
     use_fama_macbeth: bool = True
     nw_lags: int = 5
     add_intercept: bool = True
@@ -248,17 +214,13 @@ class RegressionConfig:
     # sorting
     n_buckets: int = 5
 
-    # output
+    # Output controls for Phase 2/3 (legacy names retained for compatibility)
     save_phase2_tables: bool = True
     save_phase2_plots: bool = True
 
 
 @dataclass
 class ClassificationConfig:
-    """
-    Phase 4 tail-classification settings.
-    """
-
     enabled: bool = True
 
     # Targets to classify
@@ -283,7 +245,7 @@ class ClassificationConfig:
     min_train_rows: int = 200
     min_test_rows: int = 100
 
-    # Models to run in first version
+    # Models to run
     model_names: list[str] = field(
         default_factory=lambda: [
             "logit_l2",
@@ -311,21 +273,216 @@ class ClassificationConfig:
     top_n_factor_plots: int = 15
 
 
+@dataclass
+class RandomForestPhase5Config:
+    enabled: bool = True
+
+    # targets to test
+    target_cols: list[str] = field(default_factory=lambda: [
+        "tail_left_fwd_1d",
+        "tail_left_fwd_5d",
+        "tail_abs_fwd_1d",
+    ])
+
+    # feature set variants
+    feature_sets: list[str] = field(default_factory=lambda: [
+        "factor_only",
+        "gex_only",
+        "factor_plus_gex",
+        "factor_plus_gex_plus_interaction",
+    ])
+
+    # split
+    split_type: Literal["explicit_date_range"] = "explicit_date_range"
+    train_start: Optional[str] = "2018-01-02"
+    train_end: Optional[str] = "2022-12-31"
+    test_start: Optional[str] = "2023-01-01"
+    test_end: Optional[str] = "2024-12-31"
+
+    # factor selection
+    selected_factors: Optional[list[str]] = None
+
+    # random forest hyperparameters
+    n_estimators: int = 300
+    max_depth: Optional[int] = 6
+    min_samples_leaf: int = 50
+    min_samples_split: int = 100
+    max_features: str | int | float | None = "sqrt"
+    class_weight: str | dict | None = "balanced_subsample"
+    random_state: int = 42
+    n_jobs: int = -1
+
+    # robustness
+    dropna_for_model: bool = True
+    require_binary_target: bool = True
+    min_train_rows: int = 500
+    min_test_rows: int = 200
+    min_train_positive: int = 20
+    min_test_positive: int = 10
+
+    # outputs
+    save_scores_csv: bool = True
+    save_importance_csv: bool = True
+    save_predictions_csv: bool = False
+
+    scores_filename: str = "phase5_rf_scores_all.csv"
+    importance_filename: str = "phase5_rf_feature_importance_all.csv"
+    predictions_filename: str = "phase5_rf_predictions_all.csv"
+
+
+@dataclass
+class Phase6OverlayConfig:
+    enabled: bool = True
+
+    # which factors to test as portfolio signals
+    selected_factors: Optional[list[str]] = None
+
+    # signal return column
+    portfolio_return_col: str = "ret_fwd_1d"
+
+    # bucket portfolio construction
+    n_buckets: int = 5
+    long_bucket: int = 5
+    short_bucket: int = 1
+    long_short: bool = True
+
+    # weighting
+    weighting: Literal["equal", "value"] = "equal"
+    weight_col: Optional[str] = "market_equity_crsp"
+
+    # minimum breadth per date
+    min_names_per_side: int = 5
+
+    # overlay variants to run
+    run_base: bool = True
+    run_gex_sign_overlay: bool = True
+    run_gex_quantile_overlay: bool = True
+    run_phase5_prob_overlay: bool = True
+
+    # simple GEX overlay parameters
+    neg_gex_scale: float = 0.50
+    extreme_neg_gex_scale: float = 0.25
+
+    # fragility-prob overlay parameters
+    phase5_target_col: str = "tail_left_fwd_1d"
+    phase5_model_name: str = "random_forest"
+    phase5_feature_set_preference: list[str] = field(default_factory=lambda: [
+        "factor_plus_gex_plus_interaction",
+        "factor_plus_gex",
+        "gex_only",
+        "factor_only",
+    ])
+
+    # continuous scaling formula:
+    # exposure_scale = clip(1 - prob_scale_multiplier * pred_prob, min_scale, max_scale)
+    prob_scale_multiplier: float = 1.0
+    min_scale: float = 0.10
+    max_scale: float = 1.00
+
+    # transaction cost assumption in bps per one-way turnover
+    transaction_cost_bps: float = 0.0
+
+    # outputs
+    save_summary_csv: bool = True
+    save_timeseries_csv: bool = True
+    save_date_scaling_csv: bool = True
+
+    summary_filename: str = "phase6_overlay_summary.csv"
+    timeseries_filename: str = "phase6_overlay_timeseries.csv"
+    scaling_filename: str = "phase6_overlay_scaling_by_date.csv"
+
+
+@dataclass
+class Phase7MultivariateConfig:
+    enabled: bool = True
+
+    # Targets
+    target_cols: list[str] = field(default_factory=lambda: [
+        "tail_left_fwd_1d",
+        "tail_left_fwd_5d",
+        "tail_abs_fwd_1d",
+    ])
+
+    # Curated raw factor names (not z-suffixed)
+    selected_factors: list[str] = field(default_factory=lambda: [
+        "TSignSqrtDVol1__mii",
+        "TSignSqrtDVol2__mii",
+        "bs_ratio_retail_num__mii",
+        "QuotedSpread_Dollar_tw__mii",
+        "DollarRealizedSpread_LR_Ave__mii",
+    ])
+
+    # Add GEX and explicit interactions
+    include_gex: bool = True
+    include_interactions_with_gex: bool = True
+
+    # Split
+    split_type: Literal["explicit_date_range"] = "explicit_date_range"
+    train_start: Optional[str] = "2018-01-02"
+    train_end: Optional[str] = "2022-12-31"
+    test_start: Optional[str] = "2023-01-01"
+    test_end: Optional[str] = "2024-12-31"
+
+    # Models to run
+    run_logit_elasticnet: bool = True
+    run_hgb: bool = True
+
+    # Logistic settings
+    logit_C: float = 0.5
+    logit_l1_ratio: float = 0.5
+    logit_max_iter: int = 5000
+    logit_class_weight: str | dict | None = "balanced"
+
+    # HGB settings
+    hgb_learning_rate: float = 0.05
+    hgb_max_iter: int = 200
+    hgb_max_leaf_nodes: int = 15
+    hgb_max_depth: Optional[int] = 4
+    hgb_min_samples_leaf: int = 50
+    hgb_l2_regularization: float = 0.1
+    hgb_early_stopping: bool = False
+    hgb_random_state: int = 42
+
+    # Sample quality filters
+    dropna_for_model: bool = True
+    min_train_rows: int = 500
+    min_test_rows: int = 200
+    min_train_positive: int = 20
+    min_test_positive: int = 10
+    require_binary_target: bool = True
+
+    # Inspection
+    compute_permutation_importance: bool = True
+    permutation_n_repeats: int = 10
+    permutation_scoring: str = "roc_auc"
+    permutation_random_state: int = 42
+
+    # Outputs
+    save_scores_csv: bool = True
+    save_predictions_csv: bool = True
+    save_importance_csv: bool = True
+
+    scores_filename: str = "phase7_multivariate_scores.csv"
+    predictions_filename: str = "phase7_multivariate_predictions.csv"
+    importance_filename: str = "phase7_multivariate_permutation_importance.csv"
+
+
 # ============================================================
-# Main experiment class - Phase 1 only
+# Main experiment class
 # ============================================================
 
 class GEXCollaborativeEffectExperiment:
     """
-    Phase 1 implementation for GEX collaborative effect experiments.
+    Multi-phase GEX collaborative effect experiment pipeline.
 
-    Covered in this phase:
+    Covered in this class:
     - load anchor panel from underlying GEX + CRSP daily common
     - load external factor files (csv/parquet, daily/monthly)
     - merge factors into daily PERMNO-date panel
     - preprocess panel
     - build forward targets
     - build GEX regimes
+    - run Phase 2-7 analysis and modeling modules
 
     Notes on price usage:
     - `spot` from underlying GEX is preserved for option-underlying/GEX context
@@ -342,6 +499,9 @@ class GEXCollaborativeEffectExperiment:
             classification_config: ClassificationConfig,
             output_config: OutputConfig,
             identifier_config: Optional[IdentifierConfig] = None,
+            phase5_rf_config: Optional[RandomForestPhase5Config] = None,
+            phase6_overlay_config: Optional[Phase6OverlayConfig] = None,
+            phase7_multivariate_config: Optional[Phase7MultivariateConfig] = None,
     ) -> None:
         self.data_config = data_config
         self.column_config = column_config
@@ -351,6 +511,9 @@ class GEXCollaborativeEffectExperiment:
         self.classification_config = classification_config
         self.output_config = output_config
         self.identifier_config = identifier_config or IdentifierConfig()
+        self.phase5_rf_config = phase5_rf_config or RandomForestPhase5Config()
+        self.phase6_overlay_config = phase6_overlay_config or Phase6OverlayConfig()
+        self.phase7_multivariate_config = phase7_multivariate_config or Phase7MultivariateConfig()
 
         self.output_dir = Path(self.output_config.output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -380,7 +543,7 @@ class GEXCollaborativeEffectExperiment:
             selected_factors: Optional[list[str]] = None,
     ) -> dict[str, Any]:
         """
-        Run Phase 1 only:
+        Run Phase 1 panel assembly and feature engineering:
         1. load anchor panel
         2. merge factor sources
         3. preprocess
@@ -425,7 +588,7 @@ class GEXCollaborativeEffectExperiment:
         """
         Load and merge:
         - underlying_gex_daily_with_permno
-        - crsp_daily_common_2018_2024_linked_permnos
+        - crsp_daily_common_{start_year}_{end_year}_linked_permnos
 
         Merge key:
         - permno
@@ -879,6 +1042,8 @@ class GEXCollaborativeEffectExperiment:
         - direct merge on permno-date
 
         Monthly factors:
+        todo
+        not tested yet
         - month-key merge after lag_months
         - optional forward-fill is handled structurally by month-key expansion
         """
@@ -1612,7 +1777,7 @@ class GEXCollaborativeEffectExperiment:
         return phase2
 
     # ========================================================
-    # Module 1: Regime validation
+    # Phase 2 module: Regime validation
     # ========================================================
 
     def run_regime_validation(
@@ -1642,7 +1807,7 @@ class GEXCollaborativeEffectExperiment:
         regression_rows = []
         plot_paths = {}
 
-        for y_col in y_cols:
+        for y_col in tqdm(y_cols, desc="Phase 2 | Regime validation", unit="outcome", mininterval=1):
             if y_col not in df.columns:
                 continue
 
@@ -1710,7 +1875,7 @@ class GEXCollaborativeEffectExperiment:
         return out
 
     # ========================================================
-    # Module 2: interaction regression loop
+    # Phase 2 module: Interaction regression loop
     # ========================================================
 
     def run_interaction_regression(
@@ -1761,15 +1926,21 @@ class GEXCollaborativeEffectExperiment:
 
         controls = self._get_available_control_cols(df) if self.regression_config.use_controls else []
 
+        n_total = len(y_cols) * len(factor_cols)
+        pbar = tqdm(total=n_total, desc="Phase 2 | Interaction regression", unit="combo", mininterval=2)
+
         for y_col in y_cols:
             if y_col not in df.columns:
+                pbar.update(len(factor_cols))
                 continue
 
             per_y_rows = []
 
             for factor_col in factor_cols:
+                pbar.set_postfix_str(f"{y_col} × {factor_col[:25]}")
                 factor_z_col = self._resolve_factor_z_col(df, factor_col)
                 if factor_z_col is None:
+                    pbar.update(1)
                     continue
 
                 work = df[[self.column_config.id_col, self.column_config.date_col, y_col, gex_z_col,
@@ -1791,7 +1962,6 @@ class GEXCollaborativeEffectExperiment:
                 coef_table["factor_z_col"] = factor_z_col
                 coef_table["y_col"] = y_col
 
-                # reshape to one-row summary for ranking
                 summary_row = self._extract_interaction_summary_row(
                     coef_table=coef_table,
                     factor=factor_col,
@@ -1799,6 +1969,7 @@ class GEXCollaborativeEffectExperiment:
                     y_col=y_col,
                 )
                 per_y_rows.append(summary_row)
+                pbar.update(1)
 
             if per_y_rows:
                 per_y_df = pd.DataFrame(per_y_rows).sort_values(
@@ -1824,6 +1995,8 @@ class GEXCollaborativeEffectExperiment:
                     filename=f"phase2_interaction_top_{y_col}.png",
                 )
                 top_plot_paths[y_col] = plot_path
+
+        pbar.close()
 
         summary_table = (
             pd.concat(summary_rows, ignore_index=True)
@@ -2319,7 +2492,7 @@ class GEXCollaborativeEffectExperiment:
         return phase3
 
     # ========================================================
-    # Module 3: Regime-split factor test
+    # Phase 3 module: Regime-split factor test
     # ========================================================
 
     def run_regime_split_factor_test(
@@ -2374,7 +2547,7 @@ class GEXCollaborativeEffectExperiment:
         diff_rows = []
         plot_paths = {}
 
-        for factor_col in factor_cols:
+        for factor_col in tqdm(factor_cols, desc="Phase 3 | Regime-split factor test", unit="factor", mininterval=1):
             factor_z_col = self._resolve_factor_z_col(df, factor_col)
             signal_col = factor_z_col if factor_z_col is not None else factor_col
 
@@ -2466,7 +2639,7 @@ class GEXCollaborativeEffectExperiment:
         return out
 
     # ========================================================
-    # Module 4: Double-sort analysis
+    # Phase 3 module: Double-sort analysis
     # ========================================================
 
     def run_double_sort_analysis(
@@ -2514,11 +2687,15 @@ class GEXCollaborativeEffectExperiment:
         summary_rows = []
         plot_paths = {}
 
+        n_total_ds = len(factor_cols) * len(y_cols)
+        pbar_ds = tqdm(total=n_total_ds, desc="Phase 3 | Double sort", unit="combo", mininterval=2)
+
         for factor_col in factor_cols:
             factor_z_col = self._resolve_factor_z_col(df, factor_col)
             factor_signal_col = factor_z_col if factor_z_col is not None else factor_col
 
             if factor_signal_col not in df.columns:
+                pbar_ds.update(len(y_cols))
                 continue
 
             factor_res = {
@@ -2528,7 +2705,9 @@ class GEXCollaborativeEffectExperiment:
             }
 
             for y_col in y_cols:
+                pbar_ds.set_postfix_str(f"{factor_col[:20]} × {y_col}")
                 if y_col not in df.columns:
+                    pbar_ds.update(1)
                     continue
 
                 # A: factor first, GEX second
@@ -2588,7 +2767,11 @@ class GEXCollaborativeEffectExperiment:
                     plot_paths[f"{factor_col}_{y_col}_A"] = path_A
                     plot_paths[f"{factor_col}_{y_col}_B"] = path_B
 
+                pbar_ds.update(1)
+
             results_by_factor[factor_col] = factor_res
+
+        pbar_ds.close()
 
         summary_table = pd.DataFrame(summary_rows)
 
@@ -3054,7 +3237,7 @@ class GEXCollaborativeEffectExperiment:
         return out
 
     # ========================================================
-    # Module 5: Tail classification
+    # Phase 4 module: Tail classification
     # ========================================================
 
     def run_tail_classification(
@@ -3071,7 +3254,7 @@ class GEXCollaborativeEffectExperiment:
         3. factor_plus_gex
         4. factor_plus_gex_plus_interaction
 
-        Models in initial version:
+        Baseline models:
         - logistic regression (L2)
         - elastic-net logistic regression
 
@@ -3116,23 +3299,30 @@ class GEXCollaborativeEffectExperiment:
         predictions = {}
         plot_paths = {}
 
+        n_total_p4 = len(target_cols) * len(factor_cols)
+        pbar_p4 = tqdm(total=n_total_p4, desc="Phase 4 | Tail classification", unit="combo", mininterval=2)
+
         for target_col in target_cols:
             if target_col not in df.columns:
+                pbar_p4.update(len(factor_cols))
                 continue
 
             if not self._is_binary_target(df[target_col]):
                 warnings.warn(
                     f"Skipping target '{target_col}' because it is not binary after cleaning."
                 )
+                pbar_p4.update(len(factor_cols))
                 continue
 
             predictions[target_col] = {}
 
             for factor_col in factor_cols:
+                pbar_p4.set_postfix_str(f"{target_col} × {factor_col[:25]}")
                 factor_z_col = self._resolve_factor_z_col(df, factor_col)
                 signal_col = factor_z_col if factor_z_col is not None else factor_col
 
                 if signal_col not in df.columns:
+                    pbar_p4.update(1)
                     continue
 
                 feature_sets = self._build_tail_feature_sets(
@@ -3203,6 +3393,8 @@ class GEXCollaborativeEffectExperiment:
                         predictions[target_col][f"{factor_col}__{feature_set_name}__{model_name}"] = pred_df
                         local_pred_store.append((metric_row, pred_df))
 
+                pbar_p4.update(1)
+
             # plot best ROC and best score bars per target
             target_scores = pd.DataFrame([r for r in scores_rows if r["target_col"] == target_col])
             if not target_scores.empty:
@@ -3238,6 +3430,8 @@ class GEXCollaborativeEffectExperiment:
                         filename=f"phase4_auc_bar_{target_col}.png",
                     )
                     plot_paths[f"{target_col}_auc_bar"] = bar_path
+
+        pbar_p4.close()
 
         model_scores = pd.DataFrame(scores_rows)
 
@@ -3415,8 +3609,7 @@ class GEXCollaborativeEffectExperiment:
             model_name: str,
     ):
         """
-        Simple first-version models only.
-        Updated for sklearn penalty deprecation and better convergence.
+        Build baseline linear classifiers for Phase 4.
         """
 
         from sklearn.preprocessing import StandardScaler
@@ -3580,6 +3773,1326 @@ class GEXCollaborativeEffectExperiment:
         plt.savefig(path, dpi=150)
         plt.close()
         return str(path)
+
+    # ========================================================
+    # Phase 5 helpers
+    # ========================================================
+
+    def get_gex_signal_col(self) -> str:
+        """
+        Prefer z-scored GEX if available.
+        """
+        raw = self.column_config.gex_col
+        z = f"{raw}{self.preprocess_config.zscore_suffix}"
+        if self.panel is not None and z in self.panel.columns:
+            return z
+        return raw
+
+    def get_factor_signal_cols(
+            self,
+            selected_factors: Optional[list[str]] = None,
+    ) -> list[str]:
+        """
+        Return model-ready factor columns, preferring z-scored versions.
+        """
+        if self.panel is None:
+            raise ValueError("Panel is not loaded.")
+
+        raw_factors = selected_factors if selected_factors is not None else self.factor_cols_all
+        out = []
+
+        for c in raw_factors:
+            zc = f"{c}{self.preprocess_config.zscore_suffix}"
+            if zc in self.panel.columns:
+                out.append(zc)
+            elif c in self.panel.columns:
+                out.append(c)
+
+        return list(dict.fromkeys(out))
+
+    def _build_phase5_feature_columns(
+            self,
+            factor_signal_col: str,
+            feature_set: str,
+            gex_signal_col: str,
+    ) -> list[str]:
+        """
+        Build feature columns for one factor and one feature_set mode.
+        """
+        if feature_set == "factor_only":
+            return [factor_signal_col]
+
+        if feature_set == "gex_only":
+            return [gex_signal_col]
+
+        if feature_set == "factor_plus_gex":
+            return [factor_signal_col, gex_signal_col]
+
+        if feature_set == "factor_plus_gex_plus_interaction":
+            interaction_col = f"{factor_signal_col}__x__{gex_signal_col}"
+            if self.panel is None or interaction_col not in self.panel.columns:
+                raise ValueError(
+                    f"Interaction column '{interaction_col}' not found. "
+                    "Create interaction features before running Phase 5."
+                )
+            return [factor_signal_col, gex_signal_col, interaction_col]
+
+        raise ValueError(f"Unsupported feature_set '{feature_set}'.")
+
+    def build_phase5_interaction_features(
+            self,
+            factor_signal_cols: Optional[list[str]] = None,
+            gex_signal_col: Optional[str] = None,
+    ) -> pd.DataFrame:
+        """
+        Create factor x GEX interaction features for Phase 5.
+        """
+        if self.panel is None:
+            raise ValueError("Panel must exist before creating interaction features.")
+
+        df = self.panel.copy()
+        gex_signal_col = gex_signal_col or self.get_gex_signal_col()
+        factor_signal_cols = factor_signal_cols or self.get_factor_signal_cols(
+            selected_factors=self.phase5_rf_config.selected_factors
+        )
+
+        for fc in factor_signal_cols:
+            if fc not in df.columns:
+                continue
+            interaction_col = f"{fc}__x__{gex_signal_col}"
+            df[interaction_col] = df[fc] * df[gex_signal_col]
+
+        self.panel = df
+        return df
+
+    def _phase5_train_test_split(
+            self,
+            df: pd.DataFrame,
+    ) -> tuple[pd.DataFrame, pd.DataFrame]:
+        cfg = self.phase5_rf_config
+        date_col = self.column_config.date_col
+
+        if cfg.split_type != "explicit_date_range":
+            raise ValueError(f"Unsupported split_type '{cfg.split_type}'.")
+
+        train_mask = (
+                (df[date_col] >= pd.Timestamp(cfg.train_start))
+                & (df[date_col] <= pd.Timestamp(cfg.train_end))
+        )
+        test_mask = (
+                (df[date_col] >= pd.Timestamp(cfg.test_start))
+                & (df[date_col] <= pd.Timestamp(cfg.test_end))
+        )
+
+        train_df = df.loc[train_mask].copy()
+        test_df = df.loc[test_mask].copy()
+        return train_df, test_df
+
+    def _phase5_eval_binary_classifier(
+            self,
+            y_true: pd.Series,
+            y_prob: np.ndarray,
+            threshold: float = 0.5,
+    ) -> dict:
+        y_pred = (y_prob >= threshold).astype(int)
+
+        out = {
+            "auc": np.nan,
+            "accuracy": np.nan,
+            "precision": np.nan,
+            "recall": np.nan,
+            "f1": np.nan,
+            "brier": np.nan,
+        }
+
+        y_true_np = np.asarray(y_true).astype(int)
+
+        # AUC requires both classes in y_true
+        if np.unique(y_true_np[~pd.isna(y_true_np)]).size >= 2:
+            out["auc"] = roc_auc_score(y_true_np, y_prob)
+
+        out["accuracy"] = accuracy_score(y_true_np, y_pred)
+        out["precision"] = precision_score(y_true_np, y_pred, zero_division=0)
+        out["recall"] = recall_score(y_true_np, y_pred, zero_division=0)
+        out["f1"] = f1_score(y_true_np, y_pred, zero_division=0)
+        out["brier"] = brier_score_loss(y_true_np, y_prob)
+
+        return out
+
+    def _fit_phase5_random_forest(
+            self,
+            X_train: pd.DataFrame,
+            y_train: pd.Series,
+    ) -> RandomForestClassifier:
+        cfg = self.phase5_rf_config
+
+        clf = RandomForestClassifier(
+            n_estimators=cfg.n_estimators,
+            max_depth=cfg.max_depth,
+            min_samples_leaf=cfg.min_samples_leaf,
+            min_samples_split=cfg.min_samples_split,
+            max_features=cfg.max_features,
+            class_weight=cfg.class_weight,
+            random_state=cfg.random_state,
+            n_jobs=cfg.n_jobs,
+        )
+        clf.fit(X_train, y_train)
+        return clf
+
+    def run_phase5_random_forest(self) -> dict:
+        """
+        Phase 5: nonlinear tail classification using Random Forest.
+
+        Uses the current panel generated by Phase 1 and can be run after
+        Phase 2-4 results are available.
+        """
+        if self.panel is None:
+            raise ValueError("Panel is not prepared. Run Phase 1 first.")
+
+        cfg = self.phase5_rf_config
+        df = self.panel.copy()
+
+        gex_signal_col = self.get_gex_signal_col()
+        factor_signal_cols = self.get_factor_signal_cols(selected_factors=cfg.selected_factors)
+
+        # Build interaction features once
+        self.build_phase5_interaction_features(
+            factor_signal_cols=factor_signal_cols,
+            gex_signal_col=gex_signal_col,
+        )
+        df = self.panel.copy()
+
+        score_rows = []
+        importance_rows = []
+        prediction_rows = []
+
+        n_total_p5 = len(cfg.target_cols) * len(factor_signal_cols) * len(cfg.feature_sets)
+        pbar_p5 = tqdm(total=n_total_p5, desc="Phase 5 | Random Forest", unit="combo", mininterval=2)
+
+        for target_col in cfg.target_cols:
+            if target_col not in df.columns:
+                warnings.warn(f"Skipping target '{target_col}' because it is missing.")
+                pbar_p5.update(len(factor_signal_cols) * len(cfg.feature_sets))
+                continue
+
+            for factor_signal_col in factor_signal_cols:
+                raw_factor = factor_signal_col.replace(self.preprocess_config.zscore_suffix, "")
+
+                for feature_set in cfg.feature_sets:
+                    pbar_p5.set_postfix_str(f"{target_col} × {raw_factor[:20]} × {feature_set}")
+                    try:
+                        feature_cols = self._build_phase5_feature_columns(
+                            factor_signal_col=factor_signal_col,
+                            feature_set=feature_set,
+                            gex_signal_col=gex_signal_col,
+                        )
+                    except ValueError as e:
+                        warnings.warn(str(e))
+                        continue
+
+                    model_df = df[
+                        [self.column_config.date_col, self.column_config.id_col, target_col] + feature_cols
+                        ].copy()
+
+                    if cfg.dropna_for_model:
+                        model_df = model_df.dropna(subset=[target_col] + feature_cols).copy()
+
+                    if model_df.empty:
+                        continue
+
+                    if cfg.require_binary_target:
+                        uniq = pd.Series(model_df[target_col].dropna().unique()).sort_values().tolist()
+                        if not set(uniq).issubset({0, 1}):
+                            warnings.warn(
+                                f"Skipping target '{target_col}' / factor '{raw_factor}' / feature_set '{feature_set}' "
+                                f"because target is not binary. Unique values: {uniq[:10]}"
+                            )
+                            continue
+
+                    train_df, test_df = self._phase5_train_test_split(model_df)
+
+                    if len(train_df) < cfg.min_train_rows or len(test_df) < cfg.min_test_rows:
+                        continue
+
+                    y_train = train_df[target_col].astype(int)
+                    y_test = test_df[target_col].astype(int)
+
+                    train_pos = int(y_train.sum())
+                    test_pos = int(y_test.sum())
+
+                    if train_pos < cfg.min_train_positive or test_pos < cfg.min_test_positive:
+                        continue
+
+                    X_train = train_df[feature_cols].copy()
+                    X_test = test_df[feature_cols].copy()
+
+                    model = self._fit_phase5_random_forest(X_train, y_train)
+
+                    train_prob = model.predict_proba(X_train)[:, 1]
+                    test_prob = model.predict_proba(X_test)[:, 1]
+
+                    train_metrics = self._phase5_eval_binary_classifier(y_train, train_prob)
+                    test_metrics = self._phase5_eval_binary_classifier(y_test, test_prob)
+
+                    score_rows.append({
+                        "target_col": target_col,
+                        "factor": raw_factor,
+                        "signal_col": factor_signal_col,
+                        "feature_set": feature_set,
+                        "model_name": "random_forest",
+                        "n_features": len(feature_cols),
+                        "feature_cols": "|".join(feature_cols),
+
+                        "n_train": int(len(train_df)),
+                        "n_test": int(len(test_df)),
+                        "train_pos_rate": float(y_train.mean()),
+                        "test_pos_rate": float(y_test.mean()),
+
+                        "split_type": cfg.split_type,
+                        "train_start": cfg.train_start,
+                        "train_end": cfg.train_end,
+                        "test_start": cfg.test_start,
+                        "test_end": cfg.test_end,
+
+                        "train_auc": train_metrics["auc"],
+                        "train_accuracy": train_metrics["accuracy"],
+                        "train_precision": train_metrics["precision"],
+                        "train_recall": train_metrics["recall"],
+                        "train_f1": train_metrics["f1"],
+                        "train_brier": train_metrics["brier"],
+
+                        "auc": test_metrics["auc"],
+                        "accuracy": test_metrics["accuracy"],
+                        "precision": test_metrics["precision"],
+                        "recall": test_metrics["recall"],
+                        "f1": test_metrics["f1"],
+                        "brier": test_metrics["brier"],
+                    })
+
+                    for feat, imp in zip(feature_cols, model.feature_importances_):
+                        importance_rows.append({
+                            "target_col": target_col,
+                            "factor": raw_factor,
+                            "signal_col": factor_signal_col,
+                            "feature_set": feature_set,
+                            "model_name": "random_forest",
+                            "feature": feat,
+                            "importance": float(imp),
+                            "n_train": int(len(train_df)),
+                            "n_test": int(len(test_df)),
+                        })
+
+                    if cfg.save_predictions_csv:
+                        pred_df = test_df[
+                            [self.column_config.id_col, self.column_config.date_col, target_col]
+                        ].copy()
+                        pred_df["target_col"] = target_col
+                        pred_df["factor"] = raw_factor
+                        pred_df["signal_col"] = factor_signal_col
+                        pred_df["feature_set"] = feature_set
+                        pred_df["model_name"] = "random_forest"
+                        pred_df["pred_prob"] = test_prob
+                        prediction_rows.append(pred_df)
+
+                    pbar_p5.update(1)
+
+        pbar_p5.close()
+
+        scores_df = pd.DataFrame(score_rows)
+        importance_df = pd.DataFrame(importance_rows)
+        predictions_df = pd.concat(prediction_rows, axis=0, ignore_index=True) if prediction_rows else pd.DataFrame()
+
+        if cfg.save_scores_csv and not scores_df.empty:
+            scores_df.to_csv(self.output_dir / cfg.scores_filename, index=False)
+
+        if cfg.save_importance_csv and not importance_df.empty:
+            importance_df.to_csv(self.output_dir / cfg.importance_filename, index=False)
+
+        if cfg.save_predictions_csv and not predictions_df.empty:
+            predictions_df.to_csv(self.output_dir / cfg.predictions_filename, index=False)
+
+        result = {
+            "scores": scores_df,
+            "feature_importance": importance_df,
+            "predictions": predictions_df,
+            "scores_path": str(self.output_dir / cfg.scores_filename) if cfg.save_scores_csv else None,
+            "importance_path": str(self.output_dir / cfg.importance_filename) if cfg.save_importance_csv else None,
+            "predictions_path": str(self.output_dir / cfg.predictions_filename) if cfg.save_predictions_csv else None,
+        }
+
+        self.artifacts["phase5_random_forest"] = result
+        return result
+
+    def summarize_phase5_random_forest(
+            self,
+            sort_by: str = "auc",
+            ascending: bool = False,
+    ) -> dict:
+        """
+        Summarize Phase 5 RF results.
+        """
+        if "phase5_random_forest" not in self.artifacts:
+            raise ValueError("Phase 5 random forest results not found. Run run_phase5_random_forest() first.")
+
+        scores = self.artifacts["phase5_random_forest"]["scores"].copy()
+        if scores.empty:
+            return {
+                "top_rows": pd.DataFrame(),
+                "mean_by_target_feature_set": pd.DataFrame(),
+                "mean_by_factor": pd.DataFrame(),
+            }
+
+        top_rows = scores.sort_values(sort_by, ascending=ascending).head(30).copy()
+
+        mean_by_target_feature_set = (
+            scores.groupby(["target_col", "feature_set"], as_index=False)[
+                ["auc", "accuracy", "precision", "recall", "f1", "brier"]
+            ]
+            .mean()
+            .sort_values(["target_col", "auc"], ascending=[True, False])
+        )
+
+        mean_by_factor = (
+            scores.groupby(["target_col", "factor"], as_index=False)[
+                ["auc", "accuracy", "precision", "recall", "f1", "brier"]
+            ]
+            .mean()
+            .sort_values(["target_col", "auc"], ascending=[True, False])
+        )
+
+        return {
+            "top_rows": top_rows,
+            "mean_by_target_feature_set": mean_by_target_feature_set,
+            "mean_by_factor": mean_by_factor,
+        }
+
+    # ========================================================
+    # Phase 6 helpers
+    # ========================================================
+
+    def get_phase6_factor_signal_cols(self) -> list[str]:
+        """
+        Resolve factor signal columns for Phase 6.
+        Prefers z-scored factor columns when available.
+        """
+        cfg = self.phase6_overlay_config
+        return self.get_factor_signal_cols(selected_factors=cfg.selected_factors)
+
+    def _assign_bucket_by_date(
+            self,
+            df: pd.DataFrame,
+            signal_col: str,
+            n_buckets: int,
+    ) -> pd.Series:
+        """
+        Cross-sectional signal buckets by date.
+        """
+        date_col = self.column_config.date_col
+
+        def _bucket(s: pd.Series) -> pd.Series:
+            valid = s.notna()
+            out = pd.Series(np.nan, index=s.index, dtype="float")
+            if valid.sum() < n_buckets:
+                return out
+            try:
+                out.loc[valid] = pd.qcut(
+                    s.loc[valid],
+                    q=n_buckets,
+                    labels=False,
+                    duplicates="drop",
+                ) + 1
+            except ValueError:
+                return out
+            return out
+
+        return df.groupby(date_col, group_keys=False)[signal_col].apply(_bucket).astype("Float64")
+
+    def _build_one_day_factor_weights(
+            self,
+            day_df: pd.DataFrame,
+            signal_col: str,
+    ) -> pd.DataFrame:
+        """
+        Build long-short weights for one date from signal buckets.
+        """
+        cfg = self.phase6_overlay_config
+        ret_col = cfg.portfolio_return_col
+
+        required = [self.column_config.id_col, signal_col, ret_col]
+        if cfg.weighting == "value" and cfg.weight_col is not None:
+            required.append(cfg.weight_col)
+
+        out = day_df.copy()
+        out = out.dropna(subset=[c for c in required if c in out.columns]).copy()
+
+        if out.empty:
+            return out.iloc[0:0].copy()
+
+        out["_bucket"] = pd.qcut(
+            out[signal_col].rank(method="first"),
+            q=cfg.n_buckets,
+            labels=False,
+            duplicates="drop",
+        ) + 1
+
+        long_df = out[out["_bucket"] == cfg.long_bucket].copy()
+        short_df = out[out["_bucket"] == cfg.short_bucket].copy()
+
+        if len(long_df) < cfg.min_names_per_side:
+            return out.iloc[0:0].copy()
+        if cfg.long_short and len(short_df) < cfg.min_names_per_side:
+            return out.iloc[0:0].copy()
+
+        if cfg.weighting == "value" and cfg.weight_col is not None and cfg.weight_col in out.columns:
+            long_w = long_df[cfg.weight_col].clip(lower=0).astype(float)
+            if long_w.sum() <= 0:
+                long_w = pd.Series(1.0, index=long_df.index)
+            long_df["_w_long"] = long_w / long_w.sum()
+
+            if cfg.long_short:
+                short_w = short_df[cfg.weight_col].clip(lower=0).astype(float)
+                if short_w.sum() <= 0:
+                    short_w = pd.Series(1.0, index=short_df.index)
+                short_df["_w_short"] = short_w / short_w.sum()
+        else:
+            long_df["_w_long"] = 1.0 / len(long_df)
+            if cfg.long_short:
+                short_df["_w_short"] = 1.0 / len(short_df)
+
+        long_df["_weight"] = long_df["_w_long"]
+        if cfg.long_short:
+            short_df["_weight"] = -short_df["_w_short"]
+            weights_df = pd.concat([long_df, short_df], axis=0, ignore_index=False)
+        else:
+            weights_df = long_df.copy()
+
+        return weights_df
+
+    def build_phase6_base_portfolio_series(
+            self,
+            factor_signal_col: str,
+    ) -> tuple[pd.DataFrame, pd.DataFrame]:
+        """
+        Build base portfolio daily return series for one factor.
+
+        Returns:
+        - date-level portfolio return series
+        - position-level dataframe with weights
+        """
+        if self.panel is None:
+            raise ValueError("Panel is not available.")
+
+        cfg = self.phase6_overlay_config
+        df = self.panel.copy()
+        date_col = self.column_config.date_col
+        ret_col = cfg.portfolio_return_col
+
+        needed = [self.column_config.id_col, date_col, factor_signal_col, ret_col]
+        if cfg.weighting == "value" and cfg.weight_col is not None:
+            needed.append(cfg.weight_col)
+
+        missing = [c for c in needed if c not in df.columns]
+        if missing:
+            raise ValueError(
+                f"Cannot build base portfolio for '{factor_signal_col}'. Missing columns: {missing}"
+            )
+
+        df = df[needed].copy()
+        df = df.dropna(subset=[factor_signal_col, ret_col]).copy()
+
+        weight_frames = []
+        date_groups = list(df.groupby(date_col))
+        for d, day_df in tqdm(date_groups, desc="Phase 6 | Building daily weights", unit="day", leave=False,
+                              mininterval=5):
+            try:
+                wdf = self._build_one_day_factor_weights(day_df, factor_signal_col)
+            except ValueError:
+                continue
+            if not wdf.empty:
+                wdf = wdf.copy()
+                wdf[date_col] = d
+                weight_frames.append(wdf)
+
+        if not weight_frames:
+            return pd.DataFrame(), pd.DataFrame()
+
+        pos_df = pd.concat(weight_frames, axis=0, ignore_index=True)
+
+        pos_df["_gross_weight"] = pos_df["_weight"].abs()
+        pos_df["_weighted_ret"] = pos_df["_weight"] * pos_df[ret_col]
+
+        daily = (
+            pos_df.groupby(date_col, as_index=False)
+            .agg(
+                portfolio_ret=("_weighted_ret", "sum"),
+                gross_exposure=("_gross_weight", "sum"),
+                n_names=(self.column_config.id_col, "count"),
+            )
+            .sort_values(date_col)
+            .reset_index(drop=True)
+        )
+
+        return daily, pos_df
+
+    def build_phase6_gex_scaling_by_date(self) -> pd.DataFrame:
+        """
+        Build date-level GEX overlay scales using cross-sectional aggregate GEX regime.
+        """
+        if self.panel is None:
+            raise ValueError("Panel is not available.")
+
+        cfg = self.phase6_overlay_config
+        df = self.panel.copy()
+        date_col = self.column_config.date_col
+        gex_col = self.column_config.gex_col
+
+        if gex_col not in df.columns:
+            raise ValueError(f"GEX column '{gex_col}' missing.")
+
+        agg = (
+            df.groupby(date_col, as_index=False)
+            .agg(
+                gex_cross_median=(gex_col, "median"),
+                gex_cross_mean=(gex_col, "mean"),
+                neg_gex_share=("neg_gex_flag", "mean") if "neg_gex_flag" in df.columns else (gex_col,
+                                                                                             lambda s: (s < 0).mean()),
+                extreme_neg_share=("extreme_neg_gex_flag", "mean") if "extreme_neg_gex_flag" in df.columns else (
+                    gex_col, lambda s: np.nan),
+            )
+            .sort_values(date_col)
+            .reset_index(drop=True)
+        )
+
+        # Simple sign overlay based on median cross-sectional GEX
+        agg["scale_gex_sign"] = np.where(
+            agg["gex_cross_median"] < 0,
+            cfg.neg_gex_scale,
+            1.0,
+        )
+
+        # More aggressive overlay when negative share is high
+        agg["scale_gex_quantile"] = np.where(
+            agg["neg_gex_share"] >= 0.5,
+            cfg.extreme_neg_gex_scale,
+            1.0,
+        )
+
+        return agg
+
+    def build_phase6_phase5_probability_scaling(
+            self,
+            factor_signal_col: str,
+    ) -> pd.DataFrame:
+        """
+        Build date-level fragility scaling from Phase 5 RF predictions.
+
+        Uses mean predicted probability across names on each date.
+        """
+        cfg = self.phase6_overlay_config
+        date_col = self.column_config.date_col
+        raw_factor = factor_signal_col.replace(self.preprocess_config.zscore_suffix, "")
+
+        if "phase5_random_forest" not in self.artifacts:
+            raise ValueError(
+                "Phase 5 random forest results not found in artifacts. "
+                "Run run_phase5_random_forest() before using phase5 probability overlay."
+            )
+
+        pred_df = self.artifacts["phase5_random_forest"].get("predictions")
+        if pred_df is None or pred_df.empty:
+            raise ValueError(
+                "Phase 5 predictions are missing or empty. "
+                "Set save_predictions_csv=True in Phase 5 and keep predictions in artifacts."
+            )
+
+        sub = pred_df[
+            (pred_df["factor"] == raw_factor)
+            & (pred_df["target_col"] == cfg.phase5_target_col)
+            & (pred_df["model_name"] == cfg.phase5_model_name)
+            ].copy()
+
+        if sub.empty:
+            raise ValueError(
+                f"No Phase 5 predictions found for factor '{raw_factor}' and target '{cfg.phase5_target_col}'."
+            )
+
+        # choose preferred feature_set
+        chosen = None
+        for fs in cfg.phase5_feature_set_preference:
+            sub_fs = sub[sub["feature_set"] == fs].copy()
+            if not sub_fs.empty:
+                chosen = sub_fs
+                break
+
+        if chosen is None or chosen.empty:
+            raise ValueError(
+                f"No usable Phase 5 prediction rows found for factor '{raw_factor}' "
+                f"under preferred feature sets {cfg.phase5_feature_set_preference}."
+            )
+
+        scaling = (
+            chosen.groupby(date_col, as_index=False)
+            .agg(
+                mean_pred_prob=("pred_prob", "mean"),
+                median_pred_prob=("pred_prob", "median"),
+                n_names=(self.column_config.id_col, "count"),
+            )
+            .sort_values(date_col)
+            .reset_index(drop=True)
+        )
+
+        scaling["scale_phase5_prob"] = (
+                1.0 - cfg.prob_scale_multiplier * scaling["mean_pred_prob"]
+        ).clip(lower=cfg.min_scale, upper=cfg.max_scale)
+
+        scaling["phase5_feature_set_used"] = chosen["feature_set"].iloc[0]
+        return scaling
+
+    def _estimate_turnover_and_cost(
+            self,
+            daily_ret_df: pd.DataFrame,
+            scale_col: str,
+    ) -> pd.DataFrame:
+        """
+        Approximate turnover from changes in portfolio scale only.
+        This is an overlay-level approximation, not full holdings turnover.
+        """
+        cfg = self.phase6_overlay_config
+        out = daily_ret_df.copy().sort_values(self.column_config.date_col).reset_index(drop=True)
+
+        out["_scale_prev"] = out[scale_col].shift(1)
+        out["_overlay_turnover"] = (out[scale_col] - out["_scale_prev"]).abs().fillna(0.0)
+
+        tc_rate = cfg.transaction_cost_bps / 10000.0
+        out["_overlay_cost"] = out["_overlay_turnover"] * tc_rate
+        return out
+
+    def compute_phase6_performance_stats(
+            self,
+            ret_series: pd.Series,
+    ) -> dict:
+        """
+        Compute daily-series portfolio performance summary.
+        """
+        s = pd.Series(ret_series).dropna().astype(float)
+        if s.empty:
+            return {
+                "n_days": 0,
+                "mean_daily_ret": np.nan,
+                "ann_ret": np.nan,
+                "ann_vol": np.nan,
+                "sharpe": np.nan,
+                "sortino": np.nan,
+                "max_drawdown": np.nan,
+                "downside_dev": np.nan,
+                "expected_shortfall_5": np.nan,
+                "hit_rate": np.nan,
+            }
+
+        ann_factor = 252.0
+        mean_daily = s.mean()
+        ann_ret = (1.0 + mean_daily) ** ann_factor - 1.0
+        ann_vol = s.std(ddof=0) * np.sqrt(ann_factor)
+
+        sharpe = np.nan if ann_vol == 0 or pd.isna(ann_vol) else (mean_daily / s.std(ddof=0)) * np.sqrt(ann_factor)
+
+        neg = s[s < 0]
+        downside_dev = neg.std(ddof=0) * np.sqrt(ann_factor) if len(neg) > 0 else 0.0
+        sortino = np.nan if downside_dev == 0 or pd.isna(downside_dev) else (mean_daily * ann_factor) / downside_dev
+
+        equity = (1.0 + s).cumprod()
+        running_max = equity.cummax()
+        dd = equity / running_max - 1.0
+        max_dd = dd.min()
+
+        var_5 = s.quantile(0.05)
+        es_5 = s[s <= var_5].mean() if (s <= var_5).any() else np.nan
+
+        return {
+            "n_days": int(len(s)),
+            "mean_daily_ret": float(mean_daily),
+            "ann_ret": float(ann_ret),
+            "ann_vol": float(ann_vol),
+            "sharpe": float(sharpe) if pd.notna(sharpe) else np.nan,
+            "sortino": float(sortino) if pd.notna(sortino) else np.nan,
+            "max_drawdown": float(max_dd) if pd.notna(max_dd) else np.nan,
+            "downside_dev": float(downside_dev) if pd.notna(downside_dev) else np.nan,
+            "expected_shortfall_5": float(es_5) if pd.notna(es_5) else np.nan,
+            "hit_rate": float((s > 0).mean()),
+        }
+
+    def run_phase6_portfolio_overlay(self) -> dict:
+        """
+        Phase 6: portfolio overlay backtest.
+
+        Compares:
+        - base factor portfolio
+        - GEX sign overlay
+        - GEX quantile overlay
+        - Phase 5 fragility-probability overlay
+        """
+        if self.panel is None:
+            raise ValueError("Panel is not ready. Run Phase 1 first.")
+
+        cfg = self.phase6_overlay_config
+        date_col = self.column_config.date_col
+
+        factor_signal_cols = self.get_phase6_factor_signal_cols()
+
+        summary_rows = []
+        ts_frames = []
+        scaling_frames = []
+
+        gex_scale_df = self.build_phase6_gex_scaling_by_date()
+
+        for factor_signal_col in tqdm(factor_signal_cols, desc="Phase 6 | Portfolio overlay", unit="factor",
+                                      mininterval=1):
+            raw_factor = factor_signal_col.replace(self.preprocess_config.zscore_suffix, "")
+
+            base_daily, pos_df = self.build_phase6_base_portfolio_series(factor_signal_col)
+            if base_daily.empty:
+                warnings.warn(f"Skipping Phase 6 factor '{raw_factor}' because base portfolio series is empty.")
+                continue
+
+            base_daily = base_daily.sort_values(date_col).reset_index(drop=True)
+            base_daily["factor"] = raw_factor
+            base_daily["signal_col"] = factor_signal_col
+            base_daily["strategy_name"] = "base"
+            base_daily["scale_used"] = 1.0
+            base_daily["portfolio_ret_net"] = base_daily["portfolio_ret"]
+
+            if cfg.run_base:
+                stats = self.compute_phase6_performance_stats(base_daily["portfolio_ret_net"])
+                summary_rows.append({
+                    "factor": raw_factor,
+                    "signal_col": factor_signal_col,
+                    "strategy_name": "base",
+                    **stats,
+                })
+                ts_frames.append(base_daily.copy())
+
+            # Overlay 1: GEX sign scale
+            if cfg.run_gex_sign_overlay:
+                df1 = base_daily.merge(
+                    gex_scale_df[[date_col, "scale_gex_sign"]],
+                    how="left",
+                    on=date_col,
+                )
+                df1["scale_used"] = df1["scale_gex_sign"].fillna(1.0)
+                df1["portfolio_ret_scaled"] = df1["portfolio_ret"] * df1["scale_used"]
+
+                df1 = self._estimate_turnover_and_cost(df1, scale_col="scale_used")
+                df1["portfolio_ret_net"] = df1["portfolio_ret_scaled"] - df1["_overlay_cost"]
+
+                df1["factor"] = raw_factor
+                df1["signal_col"] = factor_signal_col
+                df1["strategy_name"] = "gex_sign_overlay"
+
+                stats = self.compute_phase6_performance_stats(df1["portfolio_ret_net"])
+                summary_rows.append({
+                    "factor": raw_factor,
+                    "signal_col": factor_signal_col,
+                    "strategy_name": "gex_sign_overlay",
+                    **stats,
+                })
+                ts_frames.append(df1.copy())
+                scaling_frames.append(
+                    df1[[date_col, "factor", "signal_col", "strategy_name", "scale_used", "_overlay_turnover",
+                         "_overlay_cost"]].copy()
+                )
+
+            # Overlay 2: GEX quantile/extreme-neg scale
+            if cfg.run_gex_quantile_overlay:
+                df2 = base_daily.merge(
+                    gex_scale_df[[date_col, "scale_gex_quantile"]],
+                    how="left",
+                    on=date_col,
+                )
+                df2["scale_used"] = df2["scale_gex_quantile"].fillna(1.0)
+                df2["portfolio_ret_scaled"] = df2["portfolio_ret"] * df2["scale_used"]
+
+                df2 = self._estimate_turnover_and_cost(df2, scale_col="scale_used")
+                df2["portfolio_ret_net"] = df2["portfolio_ret_scaled"] - df2["_overlay_cost"]
+
+                df2["factor"] = raw_factor
+                df2["signal_col"] = factor_signal_col
+                df2["strategy_name"] = "gex_quantile_overlay"
+
+                stats = self.compute_phase6_performance_stats(df2["portfolio_ret_net"])
+                summary_rows.append({
+                    "factor": raw_factor,
+                    "signal_col": factor_signal_col,
+                    "strategy_name": "gex_quantile_overlay",
+                    **stats,
+                })
+                ts_frames.append(df2.copy())
+                scaling_frames.append(
+                    df2[[date_col, "factor", "signal_col", "strategy_name", "scale_used", "_overlay_turnover",
+                         "_overlay_cost"]].copy()
+                )
+
+            # Overlay 3: Phase 5 probability scaling
+            if cfg.run_phase5_prob_overlay:
+                try:
+                    prob_scale_df = self.build_phase6_phase5_probability_scaling(factor_signal_col)
+                    df3 = base_daily.merge(
+                        prob_scale_df[[date_col, "scale_phase5_prob", "mean_pred_prob", "phase5_feature_set_used"]],
+                        how="left",
+                        on=date_col,
+                    )
+                    df3["scale_used"] = df3["scale_phase5_prob"].fillna(1.0)
+                    df3["portfolio_ret_scaled"] = df3["portfolio_ret"] * df3["scale_used"]
+
+                    df3 = self._estimate_turnover_and_cost(df3, scale_col="scale_used")
+                    df3["portfolio_ret_net"] = df3["portfolio_ret_scaled"] - df3["_overlay_cost"]
+
+                    df3["factor"] = raw_factor
+                    df3["signal_col"] = factor_signal_col
+                    df3["strategy_name"] = "phase5_prob_overlay"
+
+                    stats = self.compute_phase6_performance_stats(df3["portfolio_ret_net"])
+                    summary_rows.append({
+                        "factor": raw_factor,
+                        "signal_col": factor_signal_col,
+                        "strategy_name": "phase5_prob_overlay",
+                        "phase5_feature_set_used": df3["phase5_feature_set_used"].dropna().iloc[0]
+                        if "phase5_feature_set_used" in df3.columns and df3["phase5_feature_set_used"].notna().any()
+                        else np.nan,
+                        **stats,
+                    })
+                    ts_frames.append(df3.copy())
+                    scaling_frames.append(
+                        df3[[date_col, "factor", "signal_col", "strategy_name", "scale_used", "mean_pred_prob",
+                             "_overlay_turnover", "_overlay_cost"]].copy()
+                    )
+                except Exception as e:
+                    warnings.warn(
+                        f"Skipping phase5 probability overlay for factor '{raw_factor}' : {e}"
+                    )
+
+        summary_df = pd.DataFrame(summary_rows)
+        timeseries_df = pd.concat(ts_frames, axis=0, ignore_index=True) if ts_frames else pd.DataFrame()
+        scaling_df = pd.concat(scaling_frames, axis=0, ignore_index=True) if scaling_frames else pd.DataFrame()
+
+        if cfg.save_summary_csv and not summary_df.empty:
+            summary_df.to_csv(self.output_dir / cfg.summary_filename, index=False)
+
+        if cfg.save_timeseries_csv and not timeseries_df.empty:
+            timeseries_df.to_csv(self.output_dir / cfg.timeseries_filename, index=False)
+
+        if cfg.save_date_scaling_csv and not scaling_df.empty:
+            scaling_df.to_csv(self.output_dir / cfg.scaling_filename, index=False)
+
+        result = {
+            "summary": summary_df,
+            "timeseries": timeseries_df,
+            "scaling_by_date": scaling_df,
+            "summary_path": str(self.output_dir / cfg.summary_filename) if cfg.save_summary_csv else None,
+            "timeseries_path": str(self.output_dir / cfg.timeseries_filename) if cfg.save_timeseries_csv else None,
+            "scaling_path": str(self.output_dir / cfg.scaling_filename) if cfg.save_date_scaling_csv else None,
+        }
+
+        self.artifacts["phase6_portfolio_overlay"] = result
+        return result
+
+    def summarize_phase6_portfolio_overlay(
+            self,
+            sort_by: str = "sharpe",
+            ascending: bool = False,
+    ) -> dict:
+        """
+        Summarize Phase 6 overlay results.
+        """
+        if "phase6_portfolio_overlay" not in self.artifacts:
+            raise ValueError("Phase 6 results not found. Run run_phase6_portfolio_overlay() first.")
+
+        summary = self.artifacts["phase6_portfolio_overlay"]["summary"].copy()
+        if summary.empty:
+            return {
+                "top_rows": pd.DataFrame(),
+                "mean_by_strategy": pd.DataFrame(),
+                "pivot_sharpe": pd.DataFrame(),
+            }
+
+        top_rows = summary.sort_values(sort_by, ascending=ascending).head(30).copy()
+
+        mean_by_strategy = (
+            summary.groupby("strategy_name", as_index=False)[
+                ["ann_ret", "ann_vol", "sharpe", "sortino", "max_drawdown", "expected_shortfall_5"]
+            ]
+            .mean()
+            .sort_values(sort_by, ascending=ascending)
+        )
+
+        pivot_sharpe = summary.pivot_table(
+            index="factor",
+            columns="strategy_name",
+            values="sharpe",
+            aggfunc="mean",
+        )
+
+        return {
+            "top_rows": top_rows,
+            "mean_by_strategy": mean_by_strategy,
+            "pivot_sharpe": pivot_sharpe,
+        }
+
+    def get_phase7_feature_columns(self) -> list[str]:
+        """
+        Build curated multivariate feature set for Phase 7.
+        Prefers z-scored columns when available.
+        Creates GEX interaction columns on self.panel when requested.
+        """
+        if self.panel is None:
+            raise ValueError("Panel is not loaded.")
+
+        cfg = self.phase7_multivariate_config
+        gex_signal_col = self.get_gex_signal_col()
+        factor_signal_cols = self.get_factor_signal_cols(selected_factors=cfg.selected_factors)
+
+        feature_cols = []
+
+        if cfg.include_gex:
+            if gex_signal_col not in self.panel.columns:
+                raise KeyError(f"GEX signal column '{gex_signal_col}' not found in panel.")
+            feature_cols.append(gex_signal_col)
+
+        for fc in factor_signal_cols:
+            if fc not in self.panel.columns:
+                raise KeyError(f"Factor signal column '{fc}' not found in panel.")
+            feature_cols.append(fc)
+
+        if cfg.include_interactions_with_gex:
+            for fc in factor_signal_cols:
+                interaction_col = f"{fc}__x__{gex_signal_col}"
+                if interaction_col not in self.panel.columns:
+                    self.panel[interaction_col] = self.panel[fc] * self.panel[gex_signal_col]
+                feature_cols.append(interaction_col)
+
+        return list(dict.fromkeys(feature_cols))
+
+    def _phase7_train_test_split(
+            self,
+            df: pd.DataFrame,
+    ) -> tuple[pd.DataFrame, pd.DataFrame]:
+        cfg = self.phase7_multivariate_config
+        date_col = self.column_config.date_col
+
+        if cfg.split_type != "explicit_date_range":
+            raise ValueError(f"Unsupported split_type '{cfg.split_type}'.")
+
+        train_mask = (
+                (df[date_col] >= pd.Timestamp(cfg.train_start))
+                & (df[date_col] <= pd.Timestamp(cfg.train_end))
+        )
+        test_mask = (
+                (df[date_col] >= pd.Timestamp(cfg.test_start))
+                & (df[date_col] <= pd.Timestamp(cfg.test_end))
+        )
+
+        return df.loc[train_mask].copy(), df.loc[test_mask].copy()
+
+    def _phase7_eval_binary_classifier(
+            self,
+            y_true: pd.Series,
+            y_prob: np.ndarray,
+            threshold: float = 0.5,
+    ) -> dict:
+        y_true_np = np.asarray(y_true).astype(int)
+        y_pred = (y_prob >= threshold).astype(int)
+
+        out = {
+            "auc": np.nan,
+            "accuracy": np.nan,
+            "precision": np.nan,
+            "recall": np.nan,
+            "f1": np.nan,
+            "brier": np.nan,
+        }
+
+        if np.unique(y_true_np[~pd.isna(y_true_np)]).size >= 2:
+            out["auc"] = roc_auc_score(y_true_np, y_prob)
+
+        out["accuracy"] = accuracy_score(y_true_np, y_pred)
+        out["precision"] = precision_score(y_true_np, y_pred, zero_division=0)
+        out["recall"] = recall_score(y_true_np, y_pred, zero_division=0)
+        out["f1"] = f1_score(y_true_np, y_pred, zero_division=0)
+        out["brier"] = brier_score_loss(y_true_np, y_prob)
+        return out
+
+    def _build_phase7_logit_elasticnet(self) -> Pipeline:
+        cfg = self.phase7_multivariate_config
+
+        model = Pipeline([
+            ("scaler", StandardScaler()),
+            ("clf", LogisticRegression(
+                penalty="elasticnet",
+                solver="saga",
+                C=cfg.logit_C,
+                l1_ratio=cfg.logit_l1_ratio,
+                max_iter=cfg.logit_max_iter,
+                class_weight=cfg.logit_class_weight,
+                random_state=42,
+            ))
+        ])
+        return model
+
+    def _build_phase7_hgb(self) -> HistGradientBoostingClassifier:
+        cfg = self.phase7_multivariate_config
+
+        model = HistGradientBoostingClassifier(
+            learning_rate=cfg.hgb_learning_rate,
+            max_iter=cfg.hgb_max_iter,
+            max_leaf_nodes=cfg.hgb_max_leaf_nodes,
+            max_depth=cfg.hgb_max_depth,
+            min_samples_leaf=cfg.hgb_min_samples_leaf,
+            l2_regularization=cfg.hgb_l2_regularization,
+            early_stopping=cfg.hgb_early_stopping,
+            random_state=cfg.hgb_random_state,
+        )
+        return model
+
+    def run_phase7_multivariate_model_training(self) -> dict:
+        """
+        Phase 7: curated multivariate model training.
+
+        Models:
+        - elastic-net logistic regression
+        - histogram gradient boosting classifier
+
+        Outputs:
+        - score table
+        - prediction table
+        - permutation importance table
+        """
+        if self.panel is None:
+            raise ValueError("Panel is not prepared. Run Phase 1 first.")
+
+        cfg = self.phase7_multivariate_config
+
+        # get_phase7_feature_columns() may create interaction columns on self.panel.
+        feature_cols = self.get_phase7_feature_columns()
+
+        # refresh local copy AFTER feature construction
+        df = self.panel.copy()
+
+        score_rows = []
+        prediction_frames = []
+        importance_rows = []
+        fitted_models = {}
+
+        for target_col in cfg.target_cols:
+            if target_col not in df.columns:
+                warnings.warn(f"Skipping missing target '{target_col}'.")
+                continue
+
+            missing_feature_cols = [c for c in feature_cols if c not in df.columns]
+            if missing_feature_cols:
+                raise KeyError(
+                    f"Phase 7 feature columns missing from panel after construction: {missing_feature_cols}"
+                )
+
+            model_df = df[
+                [self.column_config.id_col, self.column_config.date_col, target_col] + feature_cols
+                ].copy()
+
+            if cfg.dropna_for_model:
+                model_df = model_df.dropna(subset=[target_col] + feature_cols).copy()
+
+            if model_df.empty:
+                continue
+
+            if cfg.require_binary_target:
+                uniq = sorted(pd.Series(model_df[target_col].dropna().unique()).tolist())
+                if not set(uniq).issubset({0, 1}):
+                    warnings.warn(
+                        f"Skipping target '{target_col}' because target is not binary. Unique values: {uniq[:10]}"
+                    )
+                    continue
+
+            train_df, test_df = self._phase7_train_test_split(model_df)
+
+            if len(train_df) < cfg.min_train_rows or len(test_df) < cfg.min_test_rows:
+                warnings.warn(f"Skipping target '{target_col}' due to too few rows.")
+                continue
+
+            y_train = train_df[target_col].astype(int)
+            y_test = test_df[target_col].astype(int)
+
+            if y_train.sum() < cfg.min_train_positive or y_test.sum() < cfg.min_test_positive:
+                warnings.warn(f"Skipping target '{target_col}' due to too few positive labels.")
+                continue
+
+            X_train = train_df[feature_cols].copy()
+            X_test = test_df[feature_cols].copy()
+
+            model_specs = []
+            if cfg.run_logit_elasticnet:
+                model_specs.append(("logit_elasticnet", self._build_phase7_logit_elasticnet()))
+            if cfg.run_hgb:
+                model_specs.append(("hist_gradient_boosting", self._build_phase7_hgb()))
+
+            best_auc = -np.inf
+            best_model_name = None
+            best_model = None
+
+            for model_name, model in model_specs:
+                model.fit(X_train, y_train)
+
+                train_prob = model.predict_proba(X_train)[:, 1]
+                test_prob = model.predict_proba(X_test)[:, 1]
+
+                train_metrics = self._phase7_eval_binary_classifier(y_train, train_prob)
+                test_metrics = self._phase7_eval_binary_classifier(y_test, test_prob)
+
+                score_rows.append({
+                    "target_col": target_col,
+                    "model_name": model_name,
+                    "feature_count": len(feature_cols),
+                    "feature_cols": "|".join(feature_cols),
+
+                    "n_train": int(len(train_df)),
+                    "n_test": int(len(test_df)),
+                    "train_pos_rate": float(y_train.mean()),
+                    "test_pos_rate": float(y_test.mean()),
+
+                    "split_type": cfg.split_type,
+                    "train_start": cfg.train_start,
+                    "train_end": cfg.train_end,
+                    "test_start": cfg.test_start,
+                    "test_end": cfg.test_end,
+
+                    "train_auc": train_metrics["auc"],
+                    "train_accuracy": train_metrics["accuracy"],
+                    "train_precision": train_metrics["precision"],
+                    "train_recall": train_metrics["recall"],
+                    "train_f1": train_metrics["f1"],
+                    "train_brier": train_metrics["brier"],
+
+                    "auc": test_metrics["auc"],
+                    "accuracy": test_metrics["accuracy"],
+                    "precision": test_metrics["precision"],
+                    "recall": test_metrics["recall"],
+                    "f1": test_metrics["f1"],
+                    "brier": test_metrics["brier"],
+                })
+
+                pred_df = test_df[
+                    [self.column_config.id_col, self.column_config.date_col, target_col]
+                ].copy()
+                pred_df["model_name"] = model_name
+                pred_df["pred_prob"] = test_prob
+                prediction_frames.append(pred_df)
+
+                if pd.notna(test_metrics["auc"]) and test_metrics["auc"] > best_auc:
+                    best_auc = test_metrics["auc"]
+                    best_model_name = model_name
+                    best_model = model
+
+            if (
+                    cfg.compute_permutation_importance
+                    and best_model is not None
+                    and len(X_test) > 0
+            ):
+                perm = permutation_importance(
+                    best_model,
+                    X_test,
+                    y_test,
+                    n_repeats=cfg.permutation_n_repeats,
+                    random_state=cfg.permutation_random_state,
+                    scoring=cfg.permutation_scoring,
+                )
+                for feat, imp_mean, imp_std in zip(feature_cols, perm.importances_mean, perm.importances_std):
+                    importance_rows.append({
+                        "target_col": target_col,
+                        "model_name": best_model_name,
+                        "feature": feat,
+                        "importance_mean": float(imp_mean),
+                        "importance_std": float(imp_std),
+                        "scoring": cfg.permutation_scoring,
+                        "n_test": int(len(X_test)),
+                    })
+
+            fitted_models[target_col] = {
+                "best_model_name": best_model_name,
+                "best_model": best_model,
+                "feature_cols": feature_cols,
+            }
+
+        scores_df = pd.DataFrame(score_rows)
+        predictions_df = pd.concat(prediction_frames, axis=0,
+                                   ignore_index=True) if prediction_frames else pd.DataFrame()
+        importance_df = pd.DataFrame(importance_rows)
+
+        if cfg.save_scores_csv and not scores_df.empty:
+            scores_df.to_csv(self.output_dir / cfg.scores_filename, index=False)
+
+        if cfg.save_predictions_csv and not predictions_df.empty:
+            predictions_df.to_csv(self.output_dir / cfg.predictions_filename, index=False)
+
+        if cfg.save_importance_csv and not importance_df.empty:
+            importance_df.to_csv(self.output_dir / cfg.importance_filename, index=False)
+
+        result = {
+            "scores": scores_df,
+            "predictions": predictions_df,
+            "permutation_importance": importance_df,
+            "fitted_models": fitted_models,
+            "scores_path": str(self.output_dir / cfg.scores_filename) if cfg.save_scores_csv else None,
+            "predictions_path": str(self.output_dir / cfg.predictions_filename) if cfg.save_predictions_csv else None,
+            "importance_path": str(self.output_dir / cfg.importance_filename) if cfg.save_importance_csv else None,
+        }
+
+        self.artifacts["phase7_multivariate"] = result
+        return result
+
+    def summarize_phase7_multivariate(self) -> dict:
+        """
+        Summarize Phase 7 multivariate training results.
+        """
+        if "phase7_multivariate" not in self.artifacts:
+            raise ValueError("Run run_phase7_multivariate_model_training() first.")
+
+        scores = self.artifacts["phase7_multivariate"]["scores"].copy()
+        importance = self.artifacts["phase7_multivariate"]["permutation_importance"].copy()
+
+        if scores.empty:
+            return {
+                "scores": pd.DataFrame(),
+                "mean_by_model": pd.DataFrame(),
+                "best_by_target": pd.DataFrame(),
+                "top_importance": pd.DataFrame(),
+            }
+
+        mean_by_model = (
+            scores.groupby(["target_col", "model_name"], as_index=False)[
+                ["auc", "accuracy", "precision", "recall", "f1", "brier"]
+            ]
+            .mean()
+            .sort_values(["target_col", "auc"], ascending=[True, False])
+        )
+
+        best_by_target = (
+            scores.sort_values(["target_col", "auc"], ascending=[True, False])
+            .groupby("target_col", as_index=False)
+            .head(1)
+            .reset_index(drop=True)
+        )
+
+        top_importance = (
+            importance.sort_values(["target_col", "importance_mean"], ascending=[True, False])
+            .groupby("target_col", as_index=False)
+            .head(15)
+            .reset_index(drop=True)
+            if not importance.empty else pd.DataFrame()
+        )
+
+        return {
+            "scores": scores,
+            "mean_by_model": mean_by_model,
+            "best_by_target": best_by_target,
+            "top_importance": top_importance,
+        }
 
     # --------------------------------------------------------
     # Metadata / outputs

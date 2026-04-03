@@ -23,7 +23,6 @@ class OptionGammaConfig:
     start_date: Optional[str] = None
     end_date: Optional[str] = None
     secids: Optional[Sequence[int]] = None
-    roots: Optional[Sequence[str]] = None
 
     # Data quality controls
     require_standard_settlement: bool = True
@@ -187,10 +186,6 @@ class OptionGammaProcessor:
             secids_sql = ", ".join(str(int(x)) for x in self.cfg.secids)
             clauses.append(f"secid IN ({secids_sql})")
 
-        if self.cfg.roots:
-            roots_sql = ", ".join(f"'{str(x)}'" for x in self.cfg.roots)
-            clauses.append(f"root IN ({roots_sql})")
-
         if self.cfg.require_standard_settlement:
             clauses.append("(ss_flag = 0 OR ss_flag IS NULL)")
 
@@ -241,8 +236,6 @@ class OptionGammaProcessor:
             ss_flag,
             forward_price,
             expiry_indicator,
-            root,
-            suffix,
             datediff('day', date, exdate) AS dte
         FROM {self._option_rel_name}
         WHERE {where_sql}

@@ -146,7 +146,12 @@ class DataFetcher:
     def query_sql(self, sql: str, date_cols: Optional[list[str]] = None) -> pd.DataFrame:
         if self.db is None:
             self.connect()
-        return self.db.raw_sql(sql, date_cols=date_cols or [])
+        start_time = time.time()
+        print(f"quering... start time: {start_time}")
+        result = self.db.raw_sql(sql, date_cols=date_cols or [])
+        print(f"query complete, used time: {time.time() - start_time}")
+        return result
+
 
     def preview_table(self, library: str, table: str, n: int = 5) -> pd.DataFrame:
         q = f"select * from {library}.{table} limit {n}"

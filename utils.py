@@ -1,8 +1,16 @@
+from __future__ import annotations
 from pathlib import Path
-from typing import Optional, Union
+from typing import Optional, Union, Sequence
 import pandas as pd
 
 import duckdb
+
+
+import gc
+
+import pyarrow as pa
+import pyarrow.parquet as pq
+
 
 
 def export_parquet_sample_to_csv(
@@ -638,3 +646,264 @@ def extract_crsp_rows_for_linked_permnos(
         )
 
     return filtered
+
+
+def convert_optionmetrics_csvs_to_parquet(
+    csv_paths: Sequence[Union[str, Path]],
+    output_dir: Union[str, Path],
+    *,
+    chunksize: int = 250_000,
+    compression: str = "zstd",
+    compression_level: int | None = 6,
+) -> list[Path]:
+    """
+    Convert multiple OptionMetrics CSV files into Parquet files with a fixed schema.
+
+    Preserved schema:
+        secid             -> BIGINT
+        date              -> DATE
+        exdate            -> DATE
+        cp_flag           -> string
+        strike_price      -> DOUBLE
+        best_bid          -> DOUBLE
+        best_offer        -> DOUBLE
+        volume            -> DOUBLE
+        open_interest     -> DOUBLE
+        impl_volatility   -> DOUBLE
+        delta             -> DOUBLE
+        gamma             -> DOUBLE
+        vega              -> DOUBLE
+        theta             -> DOUBLE
+        optionid          -> BIGINT
+        cfadj             -> DOUBLE
+        contract_size     -> DOUBLE
+        ss_flag           -> INTEGER
+        forward_price     -> DOUBLE
+        expiry_indicator  -> string
+    """
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    csv_paths = [Path(p) for p in csv_paths]
+    parquet_paths: list[Path] = []
+
+    arrow_schema = pa.schema([
+        ("secid", pa.int64()),
+        ("date", pa.date32()),
+        ("exdate", pa.date32()),
+        ("cp_flag", pa.string()),
+        ("strike_price", pa.float64()),
+        ("best_bid", pa.float64()),
+        ("best_offer", pa.float64()),
+        ("volume", pa.float64()),
+        ("open_interest", pa.float64()),
+        ("impl_volatility", pa.float64()),
+        ("delta", pa.float64()),
+        ("gamma", pa.float64()),
+        ("vega", pa.float64()),
+        ("theta", pa.float64()),
+        ("optionid", pa.int64()),
+        ("cfadj", pa.float64()),
+        ("contract_size", pa.float64()),
+        ("ss_flag", pa.int32()),
+        ("forward_price", pa.float64()),
+        ("expiry_indicator", pa.string()),
+    ])
+
+    expected_columns = [field.name for field in arrow_schema]
+
+    for csv_path in csv_paths:
+        parquet_path = output_dir / f"{csv_path.stem}.parquet"
+        if parquet_path.exists():
+            parquet_path.unlink()
+
+        writer = None
+        try:
+            for chunk in pd.read_csv(
+                csv_path,
+                chunksize=chunksize,
+                low_memory=False,
+            ):
+                chunk.columns = [str(c).strip() for c in chunk.columns]
+
+                missing = [c for c in expected_columns if c not in chunk.columns]
+                if missing:
+                    raise ValueError(
+                        f"CSV {csv_path} is missing required columns: {missing}"
+                    )
+
+                chunk = chunk[expected_columns].copy()
+                chunk = _cast_optionmetrics_schema(chunk)
+
+                table = pa.Table.from_pandas(
+                    chunk,
+                    schema=arrow_schema,
+                    preserve_index=False,
+                    safe=False,
+                )
+
+                if writer is None:
+                    writer = pq.ParquetWriter(
+                        where=str(parquet_path),
+                        schema=arrow_schema,
+                        compression=compression,
+                        compression_level=compression_level,
+                        use_dictionary=True,
+                        write_statistics=True,
+                    )
+
+                writer.write_table(table)
+
+                del chunk, table
+                gc.collect()
+
+            if writer is not None:
+                writer.close()
+                writer = None
+
+            parquet_paths.append(parquet_path)
+
+        except Exception:
+            if writer is not None:
+                writer.close()
+            if parquet_path.exists():
+                parquet_path.unlink(missing_ok=True)
+            raise
+
+    return parquet_paths
+
+
+def combine_optionmetrics_parquets(
+    parquet_paths: Sequence[Union[str, Path]],
+    output_parquet_path: Union[str, Path],
+    *,
+    compression: str = "zstd",
+    compression_level: int | None = 6,
+    row_group_size: int = 250_000,
+    delete_input_parquets_after_success: bool = False,
+) -> Path:
+    """
+    Combine multiple intermediate Parquet files into one final Parquet file
+    by streaming row groups, preserving schema and minimizing peak memory usage.
+    """
+    parquet_paths = [Path(p) for p in parquet_paths]
+    output_parquet_path = Path(output_parquet_path)
+    output_parquet_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if output_parquet_path.exists():
+        output_parquet_path.unlink()
+
+    expected_schema = pa.schema([
+        ("secid", pa.int64()),
+        ("date", pa.date32()),
+        ("exdate", pa.date32()),
+        ("cp_flag", pa.string()),
+        ("strike_price", pa.float64()),
+        ("best_bid", pa.float64()),
+        ("best_offer", pa.float64()),
+        ("volume", pa.float64()),
+        ("open_interest", pa.float64()),
+        ("impl_volatility", pa.float64()),
+        ("delta", pa.float64()),
+        ("gamma", pa.float64()),
+        ("vega", pa.float64()),
+        ("theta", pa.float64()),
+        ("optionid", pa.int64()),
+        ("cfadj", pa.float64()),
+        ("contract_size", pa.float64()),
+        ("ss_flag", pa.int32()),
+        ("forward_price", pa.float64()),
+        ("expiry_indicator", pa.string()),
+    ])
+
+    writer = None
+    try:
+        for parquet_path in parquet_paths:
+            pf = pq.ParquetFile(parquet_path)
+
+            if pf.schema_arrow != expected_schema:
+                raise ValueError(
+                    f"Schema mismatch in {parquet_path}.\n"
+                    f"Expected:\n{expected_schema}\n\n"
+                    f"Found:\n{pf.schema_arrow}"
+                )
+
+            for rg_idx in range(pf.num_row_groups):
+                table = pf.read_row_group(rg_idx)
+
+                if writer is None:
+                    writer = pq.ParquetWriter(
+                        where=str(output_parquet_path),
+                        schema=expected_schema,
+                        compression=compression,
+                        compression_level=compression_level,
+                        use_dictionary=True,
+                        write_statistics=True,
+                    )
+
+                writer.write_table(table, row_group_size=row_group_size)
+
+                del table
+                gc.collect()
+
+        if writer is not None:
+            writer.close()
+            writer = None
+
+        if delete_input_parquets_after_success:
+            for p in parquet_paths:
+                p.unlink(missing_ok=True)
+
+        return output_parquet_path
+
+    except Exception:
+        if writer is not None:
+            writer.close()
+        if output_parquet_path.exists():
+            output_parquet_path.unlink(missing_ok=True)
+        raise
+
+
+def _cast_optionmetrics_schema(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Cast DataFrame columns to the exact target schema.
+    """
+    out = df.copy()
+
+    # BIGINT
+    out["secid"] = pd.to_numeric(out["secid"], errors="coerce").astype("Int64")
+    out["optionid"] = pd.to_numeric(out["optionid"], errors="coerce").astype("Int64")
+
+    # DATE
+    out["date"] = pd.to_datetime(out["date"], errors="coerce").dt.date
+    out["exdate"] = pd.to_datetime(out["exdate"], errors="coerce").dt.date
+
+    # STRING
+    out["cp_flag"] = out["cp_flag"].astype("string")
+    out["expiry_indicator"] = out["expiry_indicator"].astype("string")
+
+    # DOUBLE
+    double_cols = [
+        "strike_price",
+        "best_bid",
+        "best_offer",
+        "volume",
+        "open_interest",
+        "impl_volatility",
+        "delta",
+        "gamma",
+        "vega",
+        "theta",
+        "cfadj",
+        "contract_size",
+        "forward_price",
+    ]
+    for col in double_cols:
+        out[col] = pd.to_numeric(out[col], errors="coerce").astype("float64")
+
+    # INTEGER
+    out["ss_flag"] = pd.to_numeric(out["ss_flag"], errors="coerce").astype("Int32")
+
+    return out
+
+log_parquet_inventory(Path("data/optionmetrics_parts"))
