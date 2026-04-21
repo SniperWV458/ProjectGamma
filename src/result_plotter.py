@@ -1034,5 +1034,5 @@ class ResultPlotter:
 
 
 if __name__ == "__main__":
-    app = ResultPlotter.from_file("results/option_gamma/underlying_gex_daily.parquet")
+    app = ResultPlotter.from_file("../results/option_gamma/underlying_gex_daily.parquet")
     app.run()

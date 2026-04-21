@@ -253,6 +253,136 @@ def log_parquet_inventory(
     return output_file
 
 
+def log_csv_inventory(
+    directory: Path,
+    output_file: Optional[Path] = None,
+    recursive: bool = True,
+    encoding: str = "utf-8",
+) -> Path:
+    output_file = output_file or Path(directory) / "csv_inventory_log.txt"
+    pattern = "**/*.csv" if recursive else "*.csv"
+    csv_files = sorted(Path(directory).glob(pattern))
+
+    def _fmt_value(x):
+        if x is None:
+            return "NULL"
+        if pd.isna(x):
+            return "NULL"
+        if isinstance(x, float):
+            return f"{x:.6g}"
+        return str(x)
+
+    lines = []
+    lines.append(f"Data directory: {Path(directory).resolve()}")
+    lines.append(f"CSV files found: {len(csv_files)}")
+    lines.append("")
+
+    if not csv_files:
+        lines.append("No csv files found.")
+        output_file.write_text("\n".join(lines), encoding=encoding)
+        return output_file
+
+    for fp in csv_files:
+        rel = fp.relative_to(directory)
+
+        lines.append("=" * 100)
+        lines.append(f"FILE: {rel.as_posix()}")
+        lines.append(f"PATH: {fp.resolve()}")
+
+        try:
+            file_size_mb = fp.stat().st_size / (1024 * 1024)
+            lines.append(f"SIZE_MB: {file_size_mb:.3f}")
+        except Exception as e:
+            lines.append(f"SIZE_MB: ERROR ({e})")
+
+        try:
+            df = pd.read_csv(fp, low_memory=False)
+
+            n_rows, n_cols = df.shape
+            lines.append(f"ROWS: {n_rows}")
+            lines.append(f"COLUMNS: {n_cols}")
+            lines.append("")
+            lines.append("SCHEMA:")
+
+            for col in df.columns:
+                dtype = df[col].dtype
+                null_count = int(df[col].isna().sum())
+                lines.append(f"  - {col}: {dtype} | null_count={null_count}")
+
+            lines.append("")
+            lines.append("COLUMN STATISTICS:")
+
+            for col in df.columns:
+                s = df[col]
+                dtype_str = str(s.dtype).upper()
+
+                try:
+                    n = len(s)
+                    non_null = int(s.notna().sum())
+
+                    if pd.api.types.is_numeric_dtype(s):
+                        distinct = int(s.nunique(dropna=True))
+                        min_val = s.min(skipna=True)
+                        max_val = s.max(skipna=True)
+                        mean_val = s.mean(skipna=True)
+
+                        lines.append(
+                            f"  - {col}: n={_fmt_value(n)}, "
+                            f"non_null={_fmt_value(non_null)}, "
+                            f"distinct={_fmt_value(distinct)}, "
+                            f"min={_fmt_value(min_val)}, "
+                            f"max={_fmt_value(max_val)}, "
+                            f"mean={_fmt_value(mean_val)}"
+                        )
+
+                    elif pd.api.types.is_datetime64_any_dtype(s):
+                        distinct = int(s.nunique(dropna=True))
+                        min_val = s.min(skipna=True)
+                        max_val = s.max(skipna=True)
+
+                        lines.append(
+                            f"  - {col}: n={_fmt_value(n)}, "
+                            f"non_null={_fmt_value(non_null)}, "
+                            f"distinct={_fmt_value(distinct)}, "
+                            f"min={_fmt_value(min_val)}, "
+                            f"max={_fmt_value(max_val)}"
+                        )
+
+                    elif pd.api.types.is_bool_dtype(s):
+                        n_true = int((s == True).sum(skipna=True))
+                        n_false = int((s == False).sum(skipna=True))
+
+                        lines.append(
+                            f"  - {col}: n={_fmt_value(n)}, "
+                            f"non_null={_fmt_value(non_null)}, "
+                            f"true={_fmt_value(n_true)}, "
+                            f"false={_fmt_value(n_false)}"
+                        )
+
+                    else:
+                        distinct = int(s.nunique(dropna=True))
+                        samples = s.dropna().astype(str).drop_duplicates().head(5).tolist()
+                        sample_str = ", ".join(_fmt_value(v) for v in samples)
+
+                        lines.append(
+                            f"  - {col}: n={_fmt_value(n)}, "
+                            f"non_null={_fmt_value(non_null)}, "
+                            f"distinct={_fmt_value(distinct)}, "
+                            f"samples=[{sample_str}]"
+                        )
+
+                except Exception as e:
+                    lines.append(f"  - {col}: STAT ERROR ({e})")
+
+            lines.append("")
+
+        except Exception as e:
+            lines.append(f"ERROR READING FILE: {e}")
+            lines.append("")
+
+    output_file.write_text("\n".join(lines), encoding=encoding)
+    return output_file
+
 def export_secid_crsp_name_mapping(
     secid_file: str | Path,
     stocknames_file: str | Path,
@@ -905,5 +1035,3 @@ def _cast_optionmetrics_schema(df: pd.DataFrame) -> pd.DataFrame:
     out["ss_flag"] = pd.to_numeric(out["ss_flag"], errors="coerce").astype("Int32")
 
     return out
-
-log_parquet_inventory(Path("data/optionmetrics_parts"))

@@ -499,7 +499,7 @@ class BacktestGUI:
 
 
 if __name__ == "__main__":
-    bt_df = pd.read_csv("results/gex_collab_beta/phase6_overlay_timeseries_beta_2012_2024.csv")
+    bt_df = pd.read_csv("../results/gex_collab_mii/phase6_overlay_timeseries.csv")
     app = BacktestGUI(
         df=bt_df,
         date_col="date",

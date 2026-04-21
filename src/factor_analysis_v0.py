@@ -580,6 +580,56 @@ class GEXCollaborativeEffectExperiment:
         }
         return self.artifacts
 
+    def run_phase1_sentiment(
+            self,
+            sentiment_path: str | Path,
+            selected_factors: Optional[list[str]] = None,
+    ) -> dict[str, Any]:
+        """
+        Alternate Phase 1 using Stocktwits FinBERT sentiment as factors.
+
+        Differences from standard run_phase1:
+        - Merges sentiment (ticker-keyed, calendar-daily) instead of external
+          factor files
+        - Maps ticker -> permno via identifier mapping
+        - Rolls forward weekend/holiday sentiment to the next trading day,
+          weighting by post count
+        - Restricts panel to 2018-01-01 .. 2024-12-31 and to permnos with
+          sentiment coverage
+        - Fills remaining missing sentiment values with 0
+        """
+        self.base_panel = self.load_base_panel()
+        self.panel = self.base_panel.copy()
+
+        self.panel, sentiment_factor_cols = self._merge_sentiment_factors(
+            sentiment_path
+        )
+
+        self.factor_cols_all = sentiment_factor_cols
+        self.factor_cols_daily = sentiment_factor_cols
+        self.factor_cols_monthly = []
+        self.factor_cols_selected = sentiment_factor_cols
+
+        self.panel = self.preprocess_panel(selected_factors=selected_factors)
+        self.panel = self.build_targets()
+        self.panel = self.build_gex_regimes()
+
+        self._build_metadata()
+        self._save_phase1_outputs()
+
+        self.artifacts = {
+            "panel": self.panel,
+            "panel_path": str(self.output_dir / self.output_config.panel_snapshot_name)
+            if self.output_config.save_panel_snapshot else None,
+            "metadata": self.metadata,
+            "metadata_path": str(self.output_dir / self.output_config.metadata_name)
+            if self.output_config.save_metadata else None,
+            "factor_cols_all": self.factor_cols_all,
+            "factor_cols_daily": self.factor_cols_daily,
+            "factor_cols_monthly": self.factor_cols_monthly,
+        }
+        return self.artifacts
+
     # --------------------------------------------------------
     # Loading helpers
     # --------------------------------------------------------
@@ -1077,6 +1127,144 @@ class GEXCollaborativeEffectExperiment:
         self.factor_cols_selected = self.factor_cols_all.copy()
 
         return panel
+
+    def _merge_sentiment_factors(
+            self,
+            sentiment_path: str | Path,
+    ) -> tuple[pd.DataFrame, list[str]]:
+        """
+        Load combined sentiment CSV, map ticker -> permno, roll forward
+        non-trading-day sentiment via post-weighted averaging, merge into
+        panel, filter to sentiment-covered permnos and 2018-2024, zero-fill
+        remaining gaps.
+
+        Returns (panel, sentiment_factor_column_names).
+        """
+        id_col = self.column_config.id_col
+        date_col = self.column_config.date_col
+        score_cols = [
+            "AvgSentiment",
+            "MedianSentiment",
+            "PositiveProbAvg",
+            "NegativeProbAvg",
+            "NeutralProbAvg",
+        ]
+        all_sent_cols = ["Posts"] + score_cols
+
+        # ---- load sentiment ------------------------------------------------
+        sent = pd.read_csv(sentiment_path)
+        sent["date"] = pd.to_datetime(sent["date"], errors="coerce")
+        sent = sent[sent["date"].notna()].copy()
+        sent["Posts"] = pd.to_numeric(sent["Posts"], errors="coerce").fillna(0).astype(int)
+        for c in score_cols:
+            sent[c] = pd.to_numeric(sent[c], errors="coerce").fillna(0)
+
+        # ---- ticker -> permno via identifier mapping -----------------------
+        mapping = self.load_identifier_mapping()
+        cfg = self.identifier_config
+        sent["ticker"] = self._normalize_ticker_series(sent["ticker"])
+
+        map_df = mapping[[cfg.ticker_col, cfg.permno_col]].dropna().copy()
+        if cfg.duplicate_resolution == "first":
+            map_df = map_df.drop_duplicates(subset=[cfg.ticker_col], keep="first")
+        elif cfg.duplicate_resolution == "last":
+            map_df = map_df.drop_duplicates(subset=[cfg.ticker_col], keep="last")
+        elif cfg.duplicate_resolution == "drop_ambiguous":
+            counts = map_df.groupby(cfg.ticker_col)[cfg.permno_col].nunique()
+            good = counts[counts == 1].index
+            map_df = map_df[map_df[cfg.ticker_col].isin(good)].drop_duplicates(
+                subset=[cfg.ticker_col], keep="first"
+            )
+
+        sent = sent.merge(map_df, how="left", left_on="ticker", right_on=cfg.ticker_col)
+        if cfg.ticker_col != "ticker" and cfg.ticker_col in sent.columns:
+            sent = sent.drop(columns=[cfg.ticker_col])
+        sent = sent.rename(columns={cfg.permno_col: id_col})
+
+        n_before = len(sent)
+        sent = sent[sent[id_col].notna()].copy()
+        n_unmapped = n_before - len(sent)
+        if n_unmapped:
+            warnings.warn(
+                f"Sentiment merge: dropped {n_unmapped} rows where ticker "
+                f"could not be mapped to permno."
+            )
+        sent[id_col] = pd.to_numeric(sent[id_col], errors="coerce").astype("Int64")
+
+        # ---- filter panel to 2018-01-01 .. 2024-12-31 ---------------------
+        panel = self.panel.copy()
+        panel = panel[
+            (panel[date_col] >= pd.Timestamp("2018-01-01"))
+            & (panel[date_col] <= pd.Timestamp("2024-12-31"))
+        ].copy()
+
+        # ---- keep only permnos with sentiment coverage --------------------
+        covered = set(sent[id_col].dropna().unique())
+        panel = panel[panel[id_col].isin(covered)].copy()
+        if panel.empty:
+            warnings.warn(
+                "Panel is empty after filtering to sentiment-covered permnos."
+            )
+            for c in all_sent_cols:
+                panel[c] = pd.Series(dtype="float64")
+            return panel, all_sent_cols
+
+        # ---- align calendar dates to trading days -------------------------
+        # Trading calendar = union of all dates present in the panel
+        trading_dates = (
+            panel[date_col]
+            .drop_duplicates()
+            .sort_values()
+            .reset_index(drop=True)
+            .to_frame(name="trading_date")
+        )
+
+        sent = sent.sort_values("date").reset_index(drop=True)
+        sent = pd.merge_asof(
+            sent,
+            trading_dates,
+            left_on="date",
+            right_on="trading_date",
+            direction="forward",
+        )
+        # Drop sentiment past the last trading day in the panel
+        sent = sent[sent["trading_date"].notna()].copy()
+
+        # ---- post-weighted aggregation to trading day ----------------------
+        # For score columns: weighted average by Posts
+        # For Posts:          sum
+        for c in score_cols:
+            sent[f"_w_{c}"] = sent[c] * sent["Posts"]
+
+        agg_spec: dict[str, tuple[str, str]] = {"Posts": ("Posts", "sum")}
+        for c in score_cols:
+            agg_spec[f"_w_{c}"] = (f"_w_{c}", "sum")
+
+        grouped = (
+            sent.groupby([id_col, "trading_date"])
+            .agg(**agg_spec)
+            .reset_index()
+        )
+
+        for c in score_cols:
+            grouped[c] = grouped[f"_w_{c}"] / grouped["Posts"].replace(0, np.nan)
+            grouped.drop(columns=[f"_w_{c}"], inplace=True)
+
+        grouped = grouped.rename(columns={"trading_date": date_col})
+
+        # ---- merge into panel ----------------------------------------------
+        panel = panel.merge(
+            grouped[[id_col, date_col] + all_sent_cols],
+            on=[id_col, date_col],
+            how="left",
+        )
+
+        # ---- fill remaining missing with 0 ---------------------------------
+        for c in all_sent_cols:
+            panel[c] = panel[c].fillna(0)
+
+        panel = panel.sort_values([id_col, date_col]).reset_index(drop=True)
+        return panel, all_sent_cols
 
     # --------------------------------------------------------
     # Preprocess
