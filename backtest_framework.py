@@ -368,7 +368,7 @@ def apply_transaction_costs(
     w = weights_long.sort_values(["permno", "date"])
     prev = w.groupby("permno", sort=False)["weight"].shift(1).fillna(0.0)
     w = w.assign(_prev=prev)
-    w["_turn_row"] = (w["weight"].to_numpy(dtype=float) - w["_prev"].to_numpy(dtype=float)).abs()
+    w["_turn_row"] = (w["weight"].astype(float) - w["_prev"].astype(float)).abs()
     turn = w.groupby("date", sort=True)["_turn_row"].sum()
     turn = turn.reindex(daily_returns.index).fillna(0.0)
     cost = turn * (cost_bps / 10_000.0)

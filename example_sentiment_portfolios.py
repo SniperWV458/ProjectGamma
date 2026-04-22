@@ -108,6 +108,7 @@ def main() -> None:
         missing_return_policy="zero_contribution",
         long_only=False,
         short_only=False,
+        transaction_cost_bps=5.0,
     )
 
     panel_full = load_panel(path)
