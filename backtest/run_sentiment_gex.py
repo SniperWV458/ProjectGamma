@@ -101,6 +101,65 @@ def _avg_positions(weights: pd.DataFrame) -> float:
     return float(weights.groupby("date")["permno"].count().mean())
 
 
+def save_outputs(
+    results: dict,
+    out_dir: Path,
+    borrow_bps: float = 50,
+) -> None:
+    """Save positions, daily returns, and performance table to out_dir."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    all_weights, all_returns = [], []
+    for label, res in results.items():
+        w = res.weights_long.copy()
+        w["config"] = label
+        all_weights.append(w)
+
+        dr = adjust_for_borrow(res.daily_returns, res.weights_long, borrow_bps)
+        dr.name = label
+        all_returns.append(dr)
+
+    pd.concat(all_weights, ignore_index=True).to_parquet(out_dir / "positions.parquet", index=False)
+    pd.concat(all_returns, axis=1).to_csv(out_dir / "daily_returns.csv")
+
+    rows = [_summary_row(lbl, r, borrow_bps) for lbl, r in results.items()]
+    pd.DataFrame(rows).set_index("config").to_csv(out_dir / "performance_summary.csv")
+    print(f"Outputs saved to {out_dir}")
+
+
+def _vol_scale_weights(
+    weights: pd.DataFrame,
+    panel: pd.DataFrame,
+    vol_target: float = 0.15,
+    lookback: int = 20,
+) -> pd.DataFrame:
+    """
+    Scale portfolio weights daily so that forward-looking realized vol targets vol_target.
+    Uses trailing `lookback`-day vol of the UNscaled portfolio return to compute scale.
+    """
+    if weights.empty:
+        return weights
+
+    ret_col = "ret"
+    m = weights.merge(panel[["permno", "date", ret_col]], on=["permno", "date"], how="left")
+    r = m["_ret"] if "_ret" in m.columns else m[ret_col]
+    m = m.rename(columns={ret_col: "_ret"})
+    m["_ret"] = pd.to_numeric(m["_ret"], errors="coerce").fillna(0.0)
+    m["_contrib"] = m["weight"] * m["_ret"]
+    raw_daily = m.groupby("date", sort=True)["_contrib"].sum().astype(float)
+
+    roll_vol = raw_daily.rolling(lookback, min_periods=5).std() * np.sqrt(252)
+    roll_vol = roll_vol.shift(1).reindex(raw_daily.index).ffill()
+    scale = (vol_target / roll_vol.clip(lower=1e-4)).clip(upper=1.0)
+
+    weights = weights.copy()
+    weights["date"] = pd.to_datetime(weights["date"]).dt.normalize()
+    weights = weights.merge(scale.rename("_scale").reset_index(), on="date", how="left")
+    weights["_scale"] = weights["_scale"].fillna(1.0)
+    weights["weight"] = weights["weight"] * weights["_scale"]
+    return weights.drop(columns=["_scale"])
+
+
 def _summary_row(label: str, result, borrow_bps: float) -> dict:
     dr = adjust_for_borrow(result.daily_returns, result.weights_long, borrow_bps)
     perf = performance_metrics(dr, annualization=252)
@@ -122,6 +181,9 @@ def _summary_row(label: str, result, borrow_bps: float) -> dict:
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+
+OUTPUT_DIR = ROOT / "backtest" / "output"
+
 
 def main(rebuild_factors: bool = False) -> None:
     if rebuild_factors or not OUTPUT_PATH.exists():
@@ -198,6 +260,54 @@ def main(rebuild_factors: bool = False) -> None:
             print(f"  FAILED: {exc}")
         gc.collect()
 
+    # --- Vol-targeted variants for the best base config ---
+    best_base = "v2-A-beta-5d-LS"
+    if best_base in results:
+        panel_slim = load_panel(slim_path)
+        for vol_tgt in [0.10, 0.15, 0.20]:
+            lbl = f"{best_base}-vol{int(vol_tgt*100)}"
+            print(f"\n{'='*55}\nRunning vol-targeted: {lbl}")
+            try:
+                strat_vt = GEXSentimentStrategy(
+                    variant="A", gate="v2", neutrality="beta",
+                    n_per_leg=5, time_stop_days=5, long_leg="momentum",
+                )
+                res_vt = run_backtest(base_cfg, signal, strat_vt, benchmark_daily_returns=benchmark)
+                # Apply vol-targeting as a post-process on the computed weights
+                scaled_w = _vol_scale_weights(res_vt.weights_long, panel_slim, vol_target=vol_tgt)
+                # Recompute returns with scaled weights using the framework helper
+                from backtest_framework import compute_portfolio_returns, apply_transaction_costs
+                daily_vt, _ = compute_portfolio_returns(
+                    res_vt.panel_with_signal, scaled_w, base_cfg
+                )
+                daily_vt = apply_transaction_costs(scaled_w, daily_vt, base_cfg.transaction_cost_bps)
+                daily_vt = daily_vt.reindex(res_vt.daily_returns.index).fillna(0.0)
+                from backtest_framework import performance_metrics
+                p_vt = performance_metrics(daily_vt, annualization=252)
+                print(
+                    f"  Sharpe={p_vt.sharpe_ratio:.3f}  AnnRet={p_vt.annualized_return*100:.1f}%"
+                    f"  AnnVol={p_vt.annualized_volatility*100:.1f}%  MaxDD={p_vt.max_drawdown*100:.1f}%"
+                )
+                # Store as a synthetic result for plotting
+                import copy
+                res_copy = copy.copy(res_vt)
+                res_copy = res_vt.__class__(
+                    daily_returns=daily_vt,
+                    nav=(1 + daily_vt).cumprod(),
+                    weights_long=scaled_w,
+                    panel_with_signal=res_vt.panel_with_signal,
+                    performance=p_vt,
+                    benchmark_daily_returns=res_vt.benchmark_daily_returns,
+                    benchmark_nav=res_vt.benchmark_nav,
+                    benchmark_performance=res_vt.benchmark_performance,
+                )
+                results[lbl] = res_copy
+            except Exception as exc:
+                print(f"  FAILED: {exc}")
+            gc.collect()
+        del panel_slim
+        gc.collect()
+
     if not results:
         print("No successful results.")
         return
@@ -219,6 +329,8 @@ def main(rebuild_factors: bool = False) -> None:
 
     best = df50["sharpe"].idxmax()
     print(f"\nBest config by Sharpe (50 bps borrow): {best}")
+
+    save_outputs(results, OUTPUT_DIR, borrow_bps=50)
 
     bench_perf = list(results.values())[0].benchmark_performance
     if bench_perf:
