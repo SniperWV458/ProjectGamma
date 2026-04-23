@@ -4,8 +4,14 @@ Author: Xiwei Wang; Date: 2026-04-20
 from __future__ import annotations
 
 import sys
-from dataclasses import replace
 from pathlib import Path
+
+# Add project root to sys.path so 'backtest' can be found
+proj_root = str(Path(__file__).resolve().parent.parent)
+if proj_root not in sys.path:
+    sys.path.insert(0, proj_root)
+
+from dataclasses import replace
 
 import matplotlib.pyplot as plt
 import pandas as pd

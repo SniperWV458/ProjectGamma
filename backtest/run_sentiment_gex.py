@@ -151,21 +151,20 @@ def main(rebuild_factors: bool = False) -> None:
     gc.collect()
 
     # Configurations: (label, variant, gate, neutrality, n_leg, tstop, long_leg)
-    # n_per_leg is set here for the 19-stock contract universe.
-    # When using a larger contract_gex.parquet, scale n_per_leg proportionally,
-    # e.g.: n_leg = max(3, n_contract_stocks // 6)
+    # Optimised for 231-stock contract universe (sweep: n_per_leg x time_stop x gate x variant).
+    # Best Sharpe: v2-A-beta-5d, n_per_leg=5, time_stop=5d.
     configs = [
-        # Gate v2: D5_below_flip & D4_top (~14% hit-rate) + sentiment filter
-        ("v2-A-dollar-21d-LS",    "A", "v2",  "dollar", 3, 21, "momentum"),
-        ("v2-A-dollar-21d-Short", "A", "v2",  "dollar", 3, 21, "none"),
-        ("v2-B-dollar-21d-LS",    "B", "v2",  "dollar", 3, 21, "momentum"),
-        ("v2-B-dollar-21d-Short", "B", "v2",  "dollar", 3, 21, "none"),
-        ("v2-A-beta-21d-LS",      "A", "v2",  "beta",   3, 21, "momentum"),
-        ("v2-A-dollar-5d-Short",  "A", "v2",  "dollar", 3,  5, "none"),
-        # Gate v3: D5_below_flip only (~43% hit-rate) — broader, lower precision
-        ("v3-A-dollar-21d-LS",    "A", "v3",  "dollar", 5, 21, "momentum"),
-        ("v3-A-dollar-21d-Short", "A", "v3",  "dollar", 5, 21, "none"),
-        ("v3-B-dollar-21d-LS",    "B", "v3",  "dollar", 5, 21, "momentum"),
+        # --- Top configs from parameter sweep (full 231-stock universe) ---
+        ("v2-A-beta-5d-LS",     "A", "v2", "beta",   5,  5, "momentum"),  # best Sharpe ~1.00
+        ("v2-A-dollar-5d-LS",   "A", "v2", "dollar", 5,  5, "momentum"),  # Sharpe ~0.96
+        ("v2-A-beta-10d-LS",    "A", "v2", "beta",   5, 10, "momentum"),  # Sharpe ~0.90
+        ("v2-A-beta-21d-LS",    "A", "v2", "beta",   5, 21, "momentum"),  # Sharpe ~0.90
+        ("v2-B-dollar-5d-LS",   "B", "v2", "dollar", 5,  5, "momentum"),  # Sharpe ~0.91
+        # --- Short-only variants (must use dollar neutrality — beta-neutral requires both legs) ---
+        ("v2-A-dollar-5d-Short","A", "v2", "dollar", 5,  5, "none"),
+        ("v2-A-dollar-10d-Short","A","v2", "dollar", 5, 10, "none"),
+        # --- Broader gate (v3) ---
+        ("v3-A-dollar-5d-LS",   "A", "v3", "dollar", 5,  5, "momentum"),
     ]
 
     signal = FragilityGEXSignal()

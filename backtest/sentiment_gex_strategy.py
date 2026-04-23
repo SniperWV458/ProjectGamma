@@ -335,14 +335,13 @@ class GEXSentimentStrategy(BaseStrategy):
             shorts = day[day["side"] == "short"].copy()
             longs = day[day["side"] == "long"].copy()
 
-            # Variant B: keep only top-N by sentiment_z within the day's short pool
-            if self.variant == "B" and len(shorts) > self.n_per_leg:
+            # Both variants: keep top-N by sentiment_z when pool exceeds n_per_leg.
+            # Variant B applies this ranking every day; Variant A also ranks (not first-in).
+            if len(shorts) > self.n_per_leg:
                 shorts = shorts.nlargest(self.n_per_leg, "sentiment_z")
-            elif len(shorts) > self.n_per_leg:
-                shorts = shorts.head(self.n_per_leg)
 
             if len(longs) > self.n_per_leg:
-                longs = longs.nsmallest(self.n_per_leg, "sentiment_z")
+                longs = longs.nlargest(self.n_per_leg, "sentiment_z")
 
             n_s, n_l = len(shorts), len(longs)
             if n_s == 0 and n_l == 0:

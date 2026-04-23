@@ -18,7 +18,7 @@ import pandas as pd
 
 ROOT = Path(__file__).resolve().parent.parent
 CONTRACT_PATH = ROOT / "data" / "contract_gex.parquet"
-OUTPUT_PATH = ROOT / "data" / "gex_contract_factors.parquet"
+OUTPUT_PATH = ROOT / "data" / "gex_contract_factors_19.parquet"
 
 
 # ---------------------------------------------------------------------------

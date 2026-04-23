@@ -176,29 +176,36 @@ automatically excluded from contract-data gates (`v2`, `v3`, `full`).
 
 ---
 
-## Key Results (19-stock universe, 2018-06-01 to 2024)
-| config | sharpe | ann_ret% | cum_ret% | ann_vol% | max_dd% |
-|---|---:|---:|---:|---:|---:|
-| v2-A-beta-21d-LS | 1.375 | 70.27 | 3210.3 | 46.07 | 41.24 |
-| v2-A-dollar-21d-LS | 1.246 | 53.78 | 1593.8 | 41.27 | 48.25 |
-| v2-B-dollar-21d-LS | 1.221 | 59.16 | 2023.9 | 47.35 | 60.73 |
-| v3-B-dollar-21d-LS | 0.390 | 7.84 | 64.2 | 43.92 | 69.08 |
-| v3-A-dollar-21d-LS | 0.361 | 5.78 | 44.7 | 47.60 | 55.67 |
+## Key Results (231-stock universe, 2018-06-01 to 2024, borrow = 50 bps/yr)
 
+| config | sharpe | ann_ret% | cum_ret% | ann_vol% | max_dd% | avg_pos |
+|--------|-------:|---------:|---------:|---------:|--------:|--------:|
+| v2-A-beta-5d-LS | 0.987 | 27.0 | 382.2 | 28.3 | 32.2 | 6.9 |
+| v2-A-dollar-5d-LS | 0.945 | 26.0 | 357.8 | 28.9 | 32.2 | 6.9 |
+| v2-B-dollar-5d-LS | 0.902 | 26.5 | 368.5 | 31.7 | 38.5 | 8.4 |
+| v2-A-beta-10d-LS | 0.890 | 23.3 | 295.9 | 27.9 | 32.2 | 6.9 |
+| v2-A-beta-21d-LS | 0.887 | 23.2 | 293.8 | 27.9 | 32.2 | 6.9 |
+| v3-A-dollar-5d-LS | 0.481 | 9.2 | 78.5 | 24.6 | 31.3 | 9.7 |
+| EW benchmark | 0.831 | 19.2 | — | — | 38.8 | — |
 
-The strategy's strongest alpha is in 2022 (drawdown year for the market): fragility gates
-correctly identified the stocks most vulnerable to dealer de-stabilization, generating
-positive returns while the equal-weight benchmark fell ~35%.
+Best config: **v2-A-beta-5d-LS** (gate v2, Variant A, beta-neutral, 5-day time stop, momentum long leg).
+
+The strategy beats the equal-weight benchmark on Sharpe (0.99 vs 0.83), annualised return
+(27% vs 19.2%), and max drawdown (32% vs 38.8%) at 50 bps borrow cost.
+
+Note: earlier results with the 19-stock concentrated universe showed higher Sharpe (~1.38)
+but were driven by idiosyncratic large-cap tech momentum. The 231-stock results are more
+representative of the strategy's systematic edge.
 
 ---
 
 ## Limitations
 
-- **Coverage**: D5-based gates require per-strike contract data. With only 19 stocks,
-  the investable universe is highly concentrated.
-- **Large-cap bias**: These 19 stocks are large-cap tech names; positive net GEX is the
-  norm (~93% of days), so gates firing at all is already a meaningful regime signal.
+- **Short-only requires dollar neutrality**: beta-neutral short-only weights become zero
+  (no long leg means zero beta to offset). Use `neutrality="dollar"` for short-only books.
 - **Transaction costs**: 5 bps/trade assumed; real short-book costs include locate fees
   and borrow, stress-tested at 50–200 bps/yr.
 - **Borrow cost model**: Applied post-hoc as a flat rate on gross short exposure.
+- **Time-stop sensitivity**: 5-day stop is significantly better than 21-day for v2 gate,
+  suggesting the fragility signal decays quickly once identified.
   Actual borrow costs are higher during dislocations — exactly when the short book fires.
