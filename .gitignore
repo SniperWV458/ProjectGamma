@@ -8,3 +8,7 @@
 /src/__pycache__
 /backtest/__pycache__
 /data_legacy
+/.venv
+/backtest_hurst_ml/.idea
+/backtest_hurst_ml/__pycache__
+/backtest_hurst_ml/output
