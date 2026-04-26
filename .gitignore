@@ -12,3 +12,14 @@
 /backtest_hurst_ml/.idea
 /backtest_hurst_ml/__pycache__
 /backtest_hurst_ml/output
+/backtest_hurst_ml/output_ml
+/backtest_hurst_ml/output_new
+/backtest_hurst_ml/output_new_no_skip
+/legacy_code
+*.docx
+*.pdf
+*.txt
+*.csv
+*.parquet
+*.png
+/legacy_code
