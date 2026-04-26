@@ -34,7 +34,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
-from backtest_framework import performance_metrics
+from backtest_hurst_ml.backtest_framework import performance_metrics
 
 
 def adjust_for_borrow(daily_returns: pd.Series, weights: pd.DataFrame, borrow_bps_annual: float) -> pd.Series:
@@ -399,7 +399,7 @@ def _make_short_trade_entries(result) -> pd.DataFrame:
 
 def _stock_path_short_payoff(panel: pd.DataFrame, permno, start_date, horizon: int) -> float:
     """
-    Forward horizon short payoff from start_date using stock returns:
+    Forward horizon short payoff from the day after start_date using stock returns:
         short payoff = -(prod(1 + ret) - 1)
     """
     p = panel.loc[panel["permno"] == permno].sort_values("date")
@@ -409,7 +409,7 @@ def _stock_path_short_payoff(panel: pd.DataFrame, permno, start_date, horizon: i
 
     # Use row positions within this permno.
     loc = p.index.get_loc(idx[0])
-    sub = p.iloc[loc: loc + horizon]
+    sub = p.iloc[loc + 1: loc + 1 + horizon]
     if len(sub) == 0:
         return np.nan
 
@@ -767,19 +767,24 @@ def make_all_diagnostic_outputs(
     save_outputs(results, out_dir, borrow_bps=borrow_bps)
 
     # Main plot labels are pre-specified diagnostics, not automatically best performers.
-    # Include H10/H30/H60 short filters and H10/H30/H60 short+MLExit to avoid cherry-picking.
+    # Include H10/H30/H60 short filters and ML/LGBM exit variants to avoid cherry-picking.
     key_labels = [
         baseline_label,
         "v2-A-beta-5d-LS-MLExit",
+        "v2-A-beta-5d-LS-LGBMExit",
         "v2-A-beta-5d-LS-H10-filter-short",
         "v2-A-beta-5d-LS-H30-filter-short",
         "v2-A-beta-5d-LS-H60-filter-short",
         "v2-A-beta-5d-LS-H10-filter-short-MLExit",
         "v2-A-beta-5d-LS-H30-filter-short-MLExit",
         "v2-A-beta-5d-LS-H60-filter-short-MLExit",
+        "v2-A-beta-5d-LS-H10-filter-short-LGBMExit",
+        "v2-A-beta-5d-LS-H30-filter-short-LGBMExit",
+        "v2-A-beta-5d-LS-H60-filter-short-LGBMExit",
         "v2-A-beta-5d-LS-H30-filter-long",
         "v2-A-beta-5d-LS-H30-filter-both",
     ]
+    key_labels.extend([label for label in results if label.endswith("LGBMExit")])
     key_labels = [x for x in dict.fromkeys(key_labels) if x in results]
 
     plot_nav_drawdown(results, key_labels, out_dir, borrow_bps=borrow_bps)

@@ -16,7 +16,7 @@ import numpy as np
 import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from backtest_framework import BaseSignal, BaseStrategy
+from backtest_hurst_ml.backtest_framework import BaseSignal, BaseStrategy
 
 CONTRACT_FACTORS_DEFAULT = (
     Path(__file__).resolve().parent.parent / "data" / "gex_contract_factors.parquet"

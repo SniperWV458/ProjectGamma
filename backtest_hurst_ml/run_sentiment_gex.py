@@ -40,16 +40,18 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from backtest_framework import (
+from backtest_hurst_ml.backtest_framework import (
     BacktestConfig,
+    BacktestResult,
     equal_weight_daily_returns,
     load_panel,
+    performance_metrics,
     run_backtest,
 )
-from gex_factors_builder import build_contract_factors, CONTRACT_PATH, OUTPUT_PATH
-from sentiment_gex_strategy import FragilityGEXSignal, GEXSentimentStrategy
-from hurst_extension import FragilityGEXWithHurstSignal, GEXSentimentHurstStrategy
-from hurst_diagnostics import (
+from backtest_hurst_ml.gex_factors_builder import build_contract_factors, CONTRACT_PATH, OUTPUT_PATH
+from backtest_hurst_ml.sentiment_gex_strategy import FragilityGEXSignal, GEXSentimentStrategy
+from backtest_hurst_ml.hurst_extension import FragilityGEXWithHurstSignal, GEXSentimentHurstStrategy
+from backtest_hurst_ml.hurst_diagnostics import (
     adjust_for_borrow,
     _avg_positions,
     make_all_diagnostic_outputs,
@@ -58,16 +60,21 @@ from hurst_diagnostics import (
 )
 
 try:
-    from ml_exit import MLExitRule
+    from backtest_hurst_ml.ml_exit import MLExitRule
 except Exception:
     MLExitRule = None
+
+try:
+    from backtest_hurst_ml.ml_exit_lgbm import LGBMExitRule
+except Exception:
+    LGBMExitRule = None
 
 
 ROOT = Path(__file__).resolve().parent.parent
 PANEL_PATH = Path(r"E:\Pythonfiles\ProjectGamma\data\backtest_panel_main.parquet")
 SLIM_PANEL_PATH = Path(r"E:\Pythonfiles\ProjectGamma\data\backtest_panel_slim.parquet")
 START_DATE = "2018-06-01"
-OUTPUT_DIR = ROOT / "backtest" / "output"
+OUTPUT_DIR = ROOT / "backtest_hurst_ml" / "output_new_no_skip"
 
 SLIM_COLS = [
     "permno", "secid", "ticker", "date",
@@ -92,6 +99,7 @@ class StrategySpec:
     hurst_mode: str = "none"          # none / filter / score
     hurst_window: Optional[int] = None
     use_ml_exit: bool = False
+    use_lgbm_exit: bool = False
     apply_hurst_to_shorts: bool = True
     apply_hurst_to_longs: bool = False
 
@@ -178,7 +186,84 @@ def build_hurst_strategy(spec: StrategySpec) -> GEXSentimentHurstStrategy:
     )
 
 
-def build_specs(hurst_windows: list[int], primary_only: bool, no_ml_exit: bool) -> list[StrategySpec]:
+def _resolve_eval_start(
+    dates: pd.Index,
+    *,
+    eval_start_date: Optional[str] = None,
+    eval_after_train_days: Optional[int] = None,
+) -> Optional[pd.Timestamp]:
+    if eval_start_date:
+        return pd.Timestamp(eval_start_date).normalize()
+    if eval_after_train_days is None:
+        return None
+
+    ordered = pd.Index(pd.to_datetime(dates).normalize()).drop_duplicates().sort_values()
+    if len(ordered) == 0:
+        return None
+    idx = min(max(int(eval_after_train_days), 0), len(ordered) - 1)
+    return pd.Timestamp(ordered[idx]).normalize()
+
+
+def _slice_result_for_eval(result: BacktestResult, eval_start: Optional[pd.Timestamp]) -> BacktestResult:
+    if eval_start is None:
+        return result
+
+    eval_start = pd.Timestamp(eval_start).normalize()
+    daily = result.daily_returns[result.daily_returns.index >= eval_start].copy()
+    if daily.empty:
+        return result
+
+    nav = (1.0 + daily).cumprod()
+    weights = result.weights_long.copy()
+    if not weights.empty:
+        weights["date"] = pd.to_datetime(weights["date"]).dt.normalize()
+        weights = weights[weights["date"] >= eval_start].copy()
+
+    bench_ret = None
+    bench_nav = None
+    bench_perf = None
+    if result.benchmark_daily_returns is not None:
+        bench_ret = result.benchmark_daily_returns[result.benchmark_daily_returns.index >= eval_start].copy()
+        bench_ret = bench_ret.reindex(daily.index).fillna(0.0)
+        bench_nav = (1.0 + bench_ret).cumprod()
+        bench_perf = performance_metrics(bench_ret, annualization=252)
+
+    return BacktestResult(
+        daily_returns=daily,
+        nav=nav,
+        weights_long=weights,
+        panel_with_signal=result.panel_with_signal,
+        performance=performance_metrics(daily, annualization=252),
+        benchmark_daily_returns=bench_ret,
+        benchmark_nav=bench_nav,
+        benchmark_performance=bench_perf,
+        panel_pre_signal_lag=result.panel_pre_signal_lag,
+    )
+
+
+def build_specs(
+    hurst_windows: list[int],
+    primary_only: bool,
+    no_ml_exit: bool,
+    key_h10_exits_only: bool = False,
+) -> list[StrategySpec]:
+    if key_h10_exits_only:
+        specs = [
+            StrategySpec("v2-A-beta-5d-LS-H10-filter-short", "A", "v2", "beta", 5, 5, "momentum",
+                         family="hurst", hurst_mode="filter", hurst_window=10,
+                         apply_hurst_to_shorts=True, apply_hurst_to_longs=False),
+        ]
+        if not no_ml_exit:
+            specs.extend([
+                StrategySpec("v2-A-beta-5d-LS-H10-filter-short-MLExit", "A", "v2", "beta", 5, 5, "momentum",
+                             family="hurst", hurst_mode="filter", hurst_window=10, use_ml_exit=True,
+                             apply_hurst_to_shorts=True, apply_hurst_to_longs=False),
+                StrategySpec("v2-A-beta-5d-LS-H10-filter-short-LGBMExit", "A", "v2", "beta", 5, 5, "momentum",
+                             family="hurst", hurst_mode="filter", hurst_window=10, use_lgbm_exit=True,
+                             apply_hurst_to_shorts=True, apply_hurst_to_longs=False),
+            ])
+        return specs
+
     specs: list[StrategySpec] = []
 
     if not primary_only:
@@ -198,6 +283,9 @@ def build_specs(hurst_windows: list[int], primary_only: bool, no_ml_exit: bool) 
     if not no_ml_exit:
         specs.append(
             StrategySpec("v2-A-beta-5d-LS-MLExit", "A", "v2", "beta", 5, 5, "momentum", family="base", use_ml_exit=True)
+        )
+        specs.append(
+            StrategySpec("v2-A-beta-5d-LS-LGBMExit", "A", "v2", "beta", 5, 5, "momentum", family="base", use_lgbm_exit=True)
         )
 
     for w in hurst_windows:
@@ -233,6 +321,11 @@ def build_specs(hurst_windows: list[int], primary_only: bool, no_ml_exit: bool) 
                              family="hurst", hurst_mode="filter", hurst_window=w, use_ml_exit=True,
                              apply_hurst_to_shorts=True, apply_hurst_to_longs=False)
             )
+            specs.append(
+                StrategySpec(f"v2-A-beta-5d-LS-H{w}-filter-short-LGBMExit", "A", "v2", "beta", 5, 5, "momentum",
+                             family="hurst", hurst_mode="filter", hurst_window=w, use_lgbm_exit=True,
+                             apply_hurst_to_shorts=True, apply_hurst_to_longs=False)
+            )
 
     return specs
 
@@ -243,9 +336,14 @@ def main(
     hurst_windows: Optional[list[int]] = None,
     primary_only: bool = False,
     no_ml_exit: bool = False,
+    key_h10_exits_only: bool = False,
+    eval_start_date: Optional[str] = None,
+    eval_after_train_days: Optional[int] = None,
 ) -> None:
     if hurst_windows is None:
         hurst_windows = [10, 30, 60]
+    if key_h10_exits_only:
+        hurst_windows = [10]
 
     if rebuild_factors or not OUTPUT_PATH.exists():
         print("Building contract-level GEX factors ...")
@@ -258,6 +356,13 @@ def main(
 
     panel_full = load_panel(slim_path)
     print(f"Panel date range: {panel_full['date'].min()} to {panel_full['date'].max()}  rows={len(panel_full):,}")
+    eval_start = _resolve_eval_start(
+        pd.Index(sorted(panel_full.loc[panel_full["date"] >= pd.Timestamp(START_DATE), "date"].unique())),
+        eval_start_date=eval_start_date,
+        eval_after_train_days=eval_after_train_days,
+    )
+    if eval_start is not None:
+        print(f"Performance evaluation window starts at: {eval_start.date()} (post-training slice)")
     panel_bench = panel_full.loc[panel_full["date"] >= pd.Timestamp(START_DATE)]
     benchmark = equal_weight_daily_returns(panel_bench, "ret")
     del panel_full, panel_bench
@@ -271,7 +376,12 @@ def main(
         hurst_windows=hurst_windows,
     )
 
-    specs = build_specs(hurst_windows, primary_only=primary_only, no_ml_exit=no_ml_exit)
+    specs = build_specs(
+        hurst_windows,
+        primary_only=primary_only,
+        no_ml_exit=no_ml_exit,
+        key_h10_exits_only=key_h10_exits_only,
+    )
     results = {}
 
     for spec in specs:
@@ -286,6 +396,22 @@ def main(
                 print("  MLExitRule unavailable; skipping.")
                 continue
             entry_exit = MLExitRule(forward_days=5, train_window_days=504, retrain_freq_days=63, exit_threshold=0.55)
+        elif spec.use_lgbm_exit:
+            if LGBMExitRule is None:
+                print("  LGBMExitRule unavailable; skipping.")
+                continue
+            entry_exit = LGBMExitRule(
+                feature_panel_path=PANEL_PATH,
+                hazard_horizon_days=5,
+                adverse_return_threshold=-0.005,
+                train_window_days=756,
+                retrain_freq_days=63,
+                min_train_samples=500,
+                policy_mode="top_quantile",
+                policy_quantile=0.10,
+                policy_sides=["short"],
+                use_expanded_training_candidates=True,
+            )
 
         try:
             res = run_backtest(
@@ -295,14 +421,15 @@ def main(
                 entry_exit=entry_exit,
                 benchmark_daily_returns=benchmark,
             )
-            results[spec.label] = res
+            eval_res = _slice_result_for_eval(res, eval_start)
+            results[spec.label] = eval_res
 
-            p = res.performance
-            diag = position_diagnostics(res.weights_long, res.daily_returns.index)
-            first_dt = res.weights_long["date"].min() if not res.weights_long.empty else None
+            p = eval_res.performance
+            diag = position_diagnostics(eval_res.weights_long, eval_res.daily_returns.index)
+            first_dt = eval_res.weights_long["date"].min() if not eval_res.weights_long.empty else None
             print(
                 f"  Sharpe={p.sharpe_ratio:.3f}  AnnRet={p.annualized_return * 100:.1f}%"
-                f"  MaxDD={p.max_drawdown * 100:.1f}%  AvgPos={_avg_positions(res.weights_long):.1f}"
+                f"  MaxDD={p.max_drawdown * 100:.1f}%  AvgPos={_avg_positions(eval_res.weights_long):.1f}"
                 f"  FirstActive={first_dt}  LongEntries={diag['long_entries']}  ShortEntries={diag['short_entries']}"
             )
         except Exception as exc:
@@ -346,13 +473,22 @@ def main(
             f"  MaxDD={bench_perf.max_drawdown * 100:.1f}%"
         )
 
+    if key_h10_exits_only:
+        baseline_label = "v2-A-beta-5d-LS-H10-filter-short"
+        main_hurst_label = "v2-A-beta-5d-LS-H10-filter-short"
+        hurst_col = "hurst_10"
+    else:
+        baseline_label = "v2-A-beta-5d-LS"
+        main_hurst_label = "v2-A-beta-5d-LS-H30-filter-short"
+        hurst_col = "hurst_30"
+
     make_all_diagnostic_outputs(
         results,
         OUTPUT_DIR,
         borrow_bps=50,
-        baseline_label="v2-A-beta-5d-LS",
-        main_hurst_label="v2-A-beta-5d-LS-H30-filter-short",
-        hurst_col="hurst_30",
+        baseline_label=baseline_label,
+        main_hurst_label=main_hurst_label,
+        hurst_col=hurst_col,
     )
 
     print(f"\nDiagnostic outputs saved to: {OUTPUT_DIR}")
@@ -363,8 +499,25 @@ if __name__ == "__main__":
     parser.add_argument("--rebuild-factors", action="store_true")
     parser.add_argument("--rebuild-slim", action="store_true", help="Recreate data/backtest_panel_slim.parquet with price_abs included.")
     parser.add_argument("--hurst-windows", nargs="+", type=int, default=[10, 30, 60])
-    parser.add_argument("--primary-only", action="store_true", help="Run only primary baseline + ML + Hurst variants.")
+    parser.add_argument("--primary-only", action="store_true", default=True, help="Run only primary baseline + ML + Hurst variants.")
     parser.add_argument("--no-ml-exit", action="store_true", help="Skip MLExit variants.")
+    parser.add_argument(
+        "--key-h10-exits",
+        action="store_true",
+        default=False,
+        help="Run only v2-A-beta-5d-LS-H10-filter-short, MLExit, and LGBMExit.",
+    )
+    parser.add_argument(
+        "--eval-start-date",
+        default=None,
+        help="Report portfolio performance only from this date onward (YYYY-MM-DD).",
+    )
+    parser.add_argument(
+        "--eval-after-train-days",
+        type=int,
+        default=0,
+        help="Report performance from START_DATE plus this many trading dates (e.g. 756 for LGBM train window).",
+    )
     args = parser.parse_args()
 
     main(
@@ -373,4 +526,7 @@ if __name__ == "__main__":
         hurst_windows=args.hurst_windows,
         primary_only=args.primary_only,
         no_ml_exit=args.no_ml_exit,
+        key_h10_exits_only=args.key_h10_exits,
+        eval_start_date=args.eval_start_date,
+        eval_after_train_days=args.eval_after_train_days,
     )

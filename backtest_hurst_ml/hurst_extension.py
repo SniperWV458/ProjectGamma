@@ -22,8 +22,8 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from backtest_framework import BaseSignal, BaseStrategy
-from sentiment_gex_strategy import FragilityGEXSignal, _lifecycle_position
+from backtest_hurst_ml.backtest_framework import BaseSignal, BaseStrategy
+from backtest_hurst_ml.sentiment_gex_strategy import FragilityGEXSignal, _lifecycle_position
 
 
 def rolling_hurst_rs(prices: np.ndarray, window: int) -> np.ndarray:
